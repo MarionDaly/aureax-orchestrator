@@ -1,0 +1,220 @@
+# ============================================================================
+# Aureax Shard Worker Configuration — Prototype Template
+#
+# A worker in a sharded model group. It runs ONLY llama.cpp's rpc-server,
+# holding its share of the model's weights and executing tensor operations
+# on behalf of the group's head. It runs no llama-server and no MCP server.
+#
+# SHARED BY EVERY WORKER IN EVERY GROUP. The orchestrator generates a
+# distinct resolved config per target from this one file, so adding a worker
+# is one ssh.targets entry plus one name in the group's `workers` list —
+# no new file. (This is a deliberate exception to the usual one-file-per-node
+# rule: these nodes differ only by placeholder-resolved values. A node that
+# needs a genuine override should get its own file.)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. NODE IDENTITY
+# ----------------------------------------------------------------------------
+node:
+  # "shard_worker" is load-bearing, not descriptive. label_nodes() filters on
+  # the literal "edge_executor", so this value is exactly what keeps workers
+  # out of the edge label pass — otherwise a worker would also be scheduled a
+  # llama-server pod with no model file and crash-loop against its own group.
+  id: "${node_id}"
+  role: "shard_worker"
+  display_name: "${display_name}"
+  tags: ${tags}
+
+  # Pin rpc-server to the Cortex-A76 cluster. On RK3588 cpu0-3 are A55 at
+  # 1.8 GHz and cpu4-7 are A76 at 2.4 GHz, and the A55s reach roughly half the
+  # A76 memcpy bandwidth. `rpc_server.threads: 4` below asks for four threads
+  # but says nothing about WHERE they run; ggml barriers at every graph node
+  # and busy-spins while waiting, so a single thread landing on a little core
+  # slows the whole operation and burns the other three cores idling.
+  #
+  # Must match the thread count below: four threads on the four big cores.
+  cpu_affinity: [4, 5, 6, 7]
+
+# ----------------------------------------------------------------------------
+# 2. MODEL CONFIGURATION
+# ----------------------------------------------------------------------------
+model:
+  source: "local"
+
+  # Declared so it is obvious which model this worker serves, and because the
+  # schema requires it. The GGUF is NOT shipped here: only the head loads the
+  # file and streams tensors to workers over RPC. download-model.sh skips any
+  # node whose role is shard_worker — including all three parts of this one.
+  name: "Qwen3.5-122B-A10B"
+  filename: "Qwen3.5-122B-A10B-Q4_K_S-00001-of-00003.gguf"
+  quantization: "Q4_K_S"
+  local_path: "/opt/aureax/models/"
+
+  # Inert on a worker — no llama-server runs here, and every field has a
+  # schema default, so this block could be deleted. Kept for symmetry with
+  # the other configs, nothing more.
+  server:
+    host: "0.0.0.0"
+    port: 8080
+    threads: 4
+    threads_batch: 4
+
+  # The process this node actually runs.
+  rpc_server:
+    # "auto" resolves to the pod's host IP from the AUREAX_HOST_IP downward-API
+    # env var. Binding one interface rather than 0.0.0.0 keeps an
+    # unauthenticated port off every other link the node may have.
+    host: "auto"
+    port: 50052
+
+    # 4x A76 + 4x A55: 4 threads keeps work on the big cluster.
+    threads: 4
+
+    # Local tensor cache. Without it, every pod restart re-pulls this node's
+    # multi-GiB share of the weights across the network before it can serve.
+    cache: true
+    cache_dir: "/opt/aureax/rpc-cache"
+
+    # No memory knob here on purpose: rpc-server in the pinned build accepts
+    # only -h/-t/-d/-H/-p/-c and advertises its real free memory to the head
+    # itself. See RpcServerConfig in orchestrator/config/schema.py.
+
+# ----------------------------------------------------------------------------
+# 3. AGENT PROMPT & PERSONA (unused — no agent runs on a worker)
+# ----------------------------------------------------------------------------
+agent:
+  agent_name: "${node_id}"
+  agent_description: "Shard worker for group ${group_id}"
+
+# ----------------------------------------------------------------------------
+# 4. MCP CONFIGURATION
+# ----------------------------------------------------------------------------
+mcp:
+  # Must stay false. parse-config.py exports this as NODE_HAS_MCP_SERVER, and
+  # the shell scripts use it to skip MCP health checks against nodes that
+  # serve no MCP endpoint. A group has exactly one MCP server: its head.
+  server:
+    enabled: false
+    transport: "streamable-http"
+    port: 9000
+
+  client:
+    enabled: false
+
+# ----------------------------------------------------------------------------
+# 5. TELEMETRY & METRICS
+# ----------------------------------------------------------------------------
+# Kept on: this is what makes each member of the group individually visible
+# in the dashboard. /api/nodes is derived from the telemetry DB, so a worker
+# that reported nothing would simply not exist as far as the UI is concerned —
+# and "eight machines sharing one model" is the whole point of the group.
+telemetry:
+  enabled: true
+
+  local:
+    db_path: "/opt/aureax/metrics/telemetry.db"
+    # RESERVED — these lists are documentation, not a filter. collect_all()
+    # gathers system metrics always, plus inference metrics whenever the node
+    # has a llama-server to poll — it never consults this block. Kept accurate
+    # so it describes what actually arrives (system only here: a worker runs
+    # no llama-server); do not expect editing it to change anything.
+    collect:
+      system:
+        - "cpu_percent"
+        - "memory_percent"
+        - "disk_usage_percent"
+        - "temperature_c"
+    sample_interval_seconds: 60
+    retention_days: 7
+    # RESERVED — unenforced. retention_days above, plus the 3x hard cutoff on
+    # unpushed rows in TelemetryStorage.rotate(), is what actually bounds the
+    # local buffer.
+    max_db_size_mb: 50
+
+  remote:
+    # RESERVED — jsonl over HTTP is the only transport implemented.
+    protocol: "jsonl_http"
+    # THE ONLY VALUE THIS FROZEN ROLLBACK FILE HAS EDITED (the storage note
+    # below was reworded in the same pass, but a comment changes nothing a
+    # rollback serves). TLS is mandatory fleet-wide and the dashboard has no
+    # plaintext listener left, so a rollback that kept http:// here would come
+    # up unable to reach the orchestrator at all. Transport-wide changes only;
+    # never anything model-shaped (see ARCHITECTURE.md, "A frozen rollback
+    # target...").
+    endpoint: "${orchestrator_url}/api/v1/telemetry"
+    batch_size: 50
+    push_interval_seconds: 60
+    # RESERVED — batches are sent uncompressed.
+    compress: false
+    retry:
+      max_attempts: 3
+      backoff_base_seconds: 30
+      backoff_max_seconds: 300
+
+# ----------------------------------------------------------------------------
+# 6. PROCESS MANAGEMENT
+# ----------------------------------------------------------------------------
+process:
+  # RESERVED — managed_services and shutdown_order are descriptive only. The
+  # supervisor picks its child from node.role (client/entrypoint.py), not from
+  # this list, and tears down the one child it spawned. Only
+  # shutdown_timeout_seconds is read. (No health_check here, deliberately: a
+  # worker carries a startupProbe only — see k8s/daemonset-shard.yaml.) Kept
+  # as documentation of intent; do not expect editing the list to change what
+  # runs.
+  managed_services:
+    - name: "rpc-server"
+      type: "llama_rpc"
+      restart_policy: "always"
+      max_restarts: 10
+      restart_delay_seconds: 5
+
+  shutdown_order: ["rpc-server"]
+  # Must stay BELOW the DaemonSet's terminationGracePeriodSeconds (45s), or the
+  # kubelet's SIGKILL lands before the supervisor's own escalation.
+  shutdown_timeout_seconds: 30
+
+# ----------------------------------------------------------------------------
+# 7. STORAGE & PATHS
+# ----------------------------------------------------------------------------
+# RESERVED, the whole block — nothing reads any of these paths; every use site
+# hardcodes its own. The worker's one path that matters, its RPC tensor cache,
+# is model.rpc_server.cache_dir above, not anything here. Kept as reserved for
+# a future platform-aware storage layout; until then, changing a path here
+# moves nothing.
+storage:
+  base_path: "/opt/aureax"
+  models_path: "/opt/aureax/models"
+  logs_path: "/opt/aureax/logs"
+  queue_path: "/opt/aureax/mcp/queue"
+  metrics_path: "/opt/aureax/metrics"
+  tmp_path: "/tmp/aureax"
+
+# ----------------------------------------------------------------------------
+# 8. LOGGING
+# ----------------------------------------------------------------------------
+logging:
+  # RESERVED, all six below — level, format, output, file_path,
+  # max_file_size_mb and max_files are unread. The supervisor logs through
+  # logging.basicConfig and caps the managed child's log at a fixed 100 MB
+  # with one rotated predecessor (client/entrypoint.py::_CappedLogFile), so
+  # nothing here selects a level, a format, a destination or a rotation
+  # policy. llama_log_path is the exception: it IS read, and on a worker names
+  # the rpc-server log.
+  level: "info"
+  format: "json"
+  output: "both"
+  file_path: "/opt/aureax/logs/aureax-client.log"
+  max_file_size_mb: 50
+  max_files: 3
+  llama_log_path: "/opt/aureax/logs/rpc-server.log"
+
+# ----------------------------------------------------------------------------
+# 9. DEPLOYMENT METADATA (set by orchestrator, read-only on client)
+# ----------------------------------------------------------------------------
+deployment:
+  deployed_at: null
+  deployed_by: null
+  config_version: null
+  config_hash: null

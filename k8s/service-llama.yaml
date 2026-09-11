@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: aureax-llama
+  namespace: aureax
+  labels:
+    app: aureax-edge
+spec:
+  type: NodePort
+  # externalTrafficPolicy: Local keeps NodePort traffic on the node it hits
+  # so the dashboard can chat with the llama-server on a SPECIFIC edge node
+  # (not load-balanced). Same reasoning as service-mcp.yaml.
+  externalTrafficPolicy: Local
+  selector:
+    app: aureax-edge
+  ports:
+    # HTTPS, not HTTP: llama-server serves TLS with a leaf from the fleet CA, and
+    # carries a per-node bearer key when its config sets model.server.api_key. A
+    # reader who takes a port named "http" at face value dials plaintext against
+    # a TLS listener and gets no useful message back.
+    - name: https
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+      nodePort: 30800

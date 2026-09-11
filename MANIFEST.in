@@ -1,0 +1,9 @@
+include build_support.py uv.lock README.md ARCHITECTURE.md LICENSE CONTRIBUTING.md SECURITY.md .gitignore .dockerignore
+recursive-include orchestrator/dashboard/static *
+recursive-include scripts *.sh *.py
+recursive-include docker Dockerfile.* *.sh
+recursive-include k8s *.yaml
+include configs/aureax-network.example.yaml configs/aureax-edge.yaml configs/aureax-planner.yaml
+include configs/aureax-shard-head.yaml configs/aureax-shard-head-35b.yaml
+include configs/aureax-shard-worker.yaml configs/aureax-shard-worker-35b.yaml
+global-exclude __pycache__ *.py[cod] .DS_Store

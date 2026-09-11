@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+
+# Local data
+*.db
+models/*.gguf
+# Staging dirs from download-model.sh's parallel range fetch
+models/.pfetch.*
+
+# Claude / AI tooling
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+
+# Local notes
+TODO.md
+OPEN_SOURCE_AUDIT.md
+
+# Operator-owned fleet definition: carries SSH credentials and real addresses.
+# Copy configs/aureax-network.example.yaml to this name and edit it.
+configs/aureax-network.yaml
+configs/aureax-gpu-edge.yaml
+
+# Private runtime state and editor/SQLite side files
+/.aureax/
+# Fleet CA and leaf material. scripts/check-public-tree.py treats a committed
+# *.pem or *.key as a publication violation, so keep one dropped in the tree
+# during debugging out of `git add -A` in the first place.
+*.pem
+*.key
+*.crt
+*.p12
+.env
+.env.*
+!.env.example
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite*-wal
+*.sqlite*-shm
+models/**/*.gguf
+configs/aureax-network.yaml.*
+configs/aureax-network.*.yaml
+!configs/aureax-network.example.yaml
+configs/*.local.yaml
+.coverage*
+htmlcov/
+.mypy_cache/
+*.swp
+*.swo

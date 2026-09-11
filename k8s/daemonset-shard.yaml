@@ -1,0 +1,269 @@
+# ===========================================================================
+# Shard workers — llama.cpp rpc-server for sharded model groups.
+#
+# Each pod holds a share of one model's weights and executes tensor ops for
+# its group's head. It runs NO llama-server and NO MCP server; the group's
+# single MCP endpoint lives on the head (see daemonset-edge.yaml).
+#
+# Separate from aureax-edge because probes are DaemonSet-wide: that workload
+# uses httpGet /health on :8080, and rpc-server serves no HTTP at all, so a
+# worker riding it would never satisfy the startupProbe and would be killed on
+# that probe's budget (currently 15s + 200x15s = 3015s), forever. Its liveness
+# probe would never even start — liveness does not run until the startupProbe
+# first succeeds.
+#
+# SECURITY — READ BEFORE EXPOSING THIS ANYWHERE
+# rpc-server has no authentication and deserializes arbitrary tensor graphs;
+# CVE-2026-34159 was an unauthenticated RCE in exactly this path. Port 50052
+# is firewalled to the head by the init container below. Note also that
+# NetworkPolicy does NOT apply to hostNetwork pods, so the host firewall is
+# the only network control available here.
+# ===========================================================================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aureax-shard
+  namespace: aureax
+  labels:
+    app: aureax-shard
+spec:
+  selector:
+    matchLabels:
+      app: aureax-shard
+  template:
+    metadata:
+      labels:
+        app: aureax-shard
+    spec:
+      # A SECOND label key, orthogonal to aureax.io/role. Keeping them separate
+      # is what lets the existing stop/start machinery (which patches the
+      # aureax-edge nodeSelector and adds/removes aureax.io/role) keep working
+      # unmodified on heads and standalone nodes, while workers get their own
+      # independent switch.
+      #
+      # CONTRACT WITH kubernetes.shard_label / kubernetes.shard_label_value in
+      # configs/aureax-network.yaml, the same way daemonset-edge.yaml's selector
+      # pairs with node_label/edge_label_value. Deployer.label_shard_workers
+      # labels with those config values and lifecycle patches this selector with
+      # them, so renaming either in config while this literal stays put schedules
+      # NO worker pod and reports nothing — the head then times out waiting for
+      # peers that were never started.
+      nodeSelector:
+        aureax.io/shard: "worker"
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoSchedule"
+      # rpc-server binds <node-ip>:50052 directly, which is the address the
+      # head's --rpc list names. This also keeps the weight-shipping path off
+      # the CNI, and lets the host firewall rule work in the INPUT chain (a
+      # hostPort packet is DNAT'd through FORWARD instead, in chains K3s
+      # rewrites aggressively).
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Lets the supervisor see — and kill — an inference process orphaned by a
+      # previous pod. On THIS DaemonSet the orphan is an rpc-server: one left
+      # holding :50052 makes the replacement's own bind fail, and the head sees
+      # a peer that accepts connections but belongs to a dead pod. (The
+      # symmetric case on the head — an orphaned llama-server holding the
+      # group's RPC slots — is described in daemonset-edge.yaml.)
+      #
+      # After its pod dies the orphan is re-parented to host init, in a PID
+      # namespace a fresh container cannot otherwise see — hence hostPID rather
+      # than a check inside the pod. The reaper only ever signals a child this
+      # supervisor RECORDED — pid, start time and boot id under
+      # /opt/aureax/run, matched before the kill (client/process_ownership.py,
+      # called from client/entrypoint.py::_reap_stale_children), which here is
+      # rpc-server; an unrecorded process, whatever its name, is never touched.
+      #
+      # Cost: this container can see every process on the node. These are
+      # single-purpose appliance nodes already running hostNetwork and hostPath.
+      hostPID: true
+      # Nothing in client/ talks to the Kubernetes API server, so the default
+      # ServiceAccount token the kubelet would otherwise mount at
+      # /var/run/secrets/kubernetes.io/serviceaccount is an unused credential
+      # sitting behind :50052 — the unauthenticated, arbitrary-tensor-graph
+      # deserializing port described in the SECURITY header above. Bounded
+      # impact (this repo defines no Role or RoleBinding, so the token carries
+      # only system:authenticated), but there is no worse place to leave one.
+      automountServiceAccountToken: false
+      # Must stay AHEAD of process.shutdown_timeout_seconds (30s) in the edge
+      # config. The supervisor SIGTERMs rpc-server and waits that long before
+      # escalating to SIGKILL; at the K8s default of 30s the kubelet's own
+      # SIGKILL lands at the same instant, so the in-container escalation and
+      # the log-file close never get to run.
+      terminationGracePeriodSeconds: 45
+      # Failure to install the policy for any IP family this host has blocks RPC startup.
+      #
+      # The allowlist is baked in at POD START from model.rpc_server.allowed_clients
+      # in the mounted config, and nothing re-runs it for the life of the pod.
+      # `aureax apply` pushes a worker's new config but deliberately never
+      # restarts a worker, so a group whose head address changed needs
+      # `aureax generate` + `aureax apply` and then `aureax stop && aureax start`:
+      # until the pod is recreated this worker DROPs the new head and the group
+      # hangs at the RPC handshake with no error on either side. README carries
+      # the same rule for operators.
+      initContainers:
+        - name: rpc-firewall
+          image: aureax-client:dev
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/python", "-m", "client.rpc_firewall"]
+          env:
+            - name: AUREAX_HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aureax
+              readOnly: true
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN"]
+      containers:
+        - name: aureax-client
+          image: aureax-client:dev
+          imagePullPolicy: Never    # Image built locally on node
+          ports:
+            - containerPort: 50052
+              name: rpc
+              protocol: TCP
+          env:
+            # The KUBERNETES node name — the host — not the fleet's node.id,
+            # which comes from the mounted config. Its only consumer is the
+            # container banner in docker/scripts/start.sh.
+            - name: AUREAX_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Lets rpc_server.host: "auto" bind this node's LAN address rather
+            # than 0.0.0.0 — an unauthenticated port should not be offered on
+            # every interface the node happens to have.
+            - name: AUREAX_HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # Same file an edge pod would read; it just says role: shard_worker.
+            - name: AUREAX_CONFIG_PATH
+              value: "/etc/aureax/aureax-edge.yaml"
+            - name: RPC_SERVER_PATH
+              value: "/usr/local/bin/rpc-server"
+          resources:
+            # Derived, not guessed. A worker holds model_size / n_workers of the
+            # weights plus its KV share and compute buffers, so this block has to
+            # move when EITHER the model or the worker count changes:
+            #
+            #   27B         / 3 workers: 15.7 GiB / 3 = 5.2 GiB (measured RSS 5.1-5.7)
+            #   27B         / 7 workers: 15.7 GiB / 7 = 2.2 GiB (measured RSS 2.0-2.9)
+            #   122B Q3_K   / 7 workers: 53.1 GiB / 7 = 7.6 GiB (measured RSS 6.5-8.6)
+            #   122B Q4_K_S / 7 workers: 66.8 GiB / 7 = 9.5 GiB
+            #   35B-A3B Q4_K_M / 3 workers: 20.5 GiB / 3 = 6.9 GiB  <- current, x2 groups
+            #
+            # This file is shared by BOTH groups' workers, which is safe because
+            # both serve the same model over the same worker count.
+            #
+            # AN EVEN tensor_split IS NO LONGER AN EVEN FOOTPRINT, and at 128k
+            # context that is the part worth reading. Two structural effects
+            # that no split value can flatten:
+            #   - llama.cpp divides by act_gpu_layers = n_layer + 1 = 41, so the
+            #     40 layers land 14 / 14 / 12 and the LAST device also carries
+            #     the output tensor.
+            #   - Only 10 of the 40 layers are full attention (il 3,7,...,39), so
+            #     they land 3 / 4 / 3. At 131072 ctx the group's 2.50 GiB of KV
+            #     therefore splits 0.75 / 1.00 / 0.75 GiB — a 1.33x spread.
+            # Peak worker is the MIDDLE one:
+            #     6.90 weights + 1.00 KV + 0.02 recurrent + ~0.5 compute
+            #     + ~0.4 rpc-server/supervisor  =  ~8.8 GiB
+            #
+            # 11Gi IS A TRIPWIRE, NOT JUST HEADROOM. It sits deliberately above
+            # that ~8.8 GiB peak and BELOW the ~12.8 GiB the same worker needs if
+            # flash attention is off — because without it llama.cpp reserves an
+            # [n_kv x n_ubatch x n_head_q] F32 score tensor, 4.00 GiB at 131072 /
+            # 512 / 16. So a worker that somehow loses flash attention OOM-kills
+            # during startup, loudly and before /health, instead of quietly
+            # eating 4 GiB. These nodes have NO SWAP and ~13.0 GiB free, so the
+            # quiet version is what takes the kubelet with it.
+            # See configs/aureax-shard-head-35b.yaml `flash_attention`.
+            #
+            # 11Gi also still covers the 122B rollback target — but ONLY at the
+            # 7 workers it ran on (66.8 GiB / 7 = 9.5 GiB, ~10.0 GiB with
+            # overhead), which is why it was not tightened further. That is a
+            # CEILING to preserve, not a description of the current fleet: at
+            # today's 3 workers per group the same model would want 66.8 / 3 =
+            # 22.3 GiB each and OOM instantly. Reverting therefore means
+            # restoring the single 7-worker group in aureax-network.yaml's
+            # node_groups as well as flipping the eight config_file lines — and
+            # `aureax generate` stops a partial revert before any pod is
+            # scheduled, because aureax-shard-head.yaml's 7-entry tensor_split
+            # fails validate_groups against a 3-worker group.
+            #
+            # Do NOT lower 11Gi to fit the 35B: it is also the flash-attention
+            # tripwire described above, and lowering it arms the rollback trap.
+            #
+            # If you revert tensor_split to empty, these numbers are no longer safe.
+            requests:
+              memory: "8Gi"
+              cpu: "2"
+            limits:
+              memory: "11Gi"
+              # No CPU limit, deliberately. A CPU limit installs a CFS quota
+              # and llama.cpp's threads get throttled in bursts, producing
+              # "randomly slow, sometimes fine" behaviour that is very hard to
+              # diagnose live. The CPU *request* still governs scheduling.
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aureax
+              readOnly: true
+            # Carries the rpc-server tensor cache ($LLAMA_CACHE). Without a
+            # persistent path, every pod restart re-pulls this node's
+            # multi-GiB share of the weights across the network.
+            - name: data
+              mountPath: /opt/aureax
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # runAsNonRoot is NOT set: the base image has no non-root USER, and
+            # the hostPath at /opt/aureax is root-owned, so enforcing it here
+            # would only trade an RCE-hardening step for a pod that never
+            # starts. The firewall rule scoping 50052 to the head is the
+            # primary control. Revisit alongside a non-root image.
+          # A startupProbe ONLY — no readiness, no liveness. Deliberate.
+          #
+          # rpc-server serves ONE client at a time and listens with a backlog
+          # of 1, so once the head is connected a second TCP connection is not
+          # accepted: any recurring probe fails for exactly as long as the
+          # worker is doing its job. Observed both ways here — with a liveness
+          # probe the kubelet SIGTERMed workers mid-load and the whole group
+          # crash-looped in lockstep; with a readiness probe the workers simply
+          # sat at 0/1 while serving perfectly.
+          #
+          # A startupProbe runs only until its first success, so it still gates
+          # "rpc-server actually came up" (which is what the deploy waits on)
+          # and then stops probing forever.
+          #
+          # Nothing is lost by dropping the other two: the supervisor
+          # propagates rpc-server's exit code
+          # (client/entrypoint.py::_run_shard_worker), so a genuinely dead
+          # worker exits its container and K8s restarts the pod. And the head
+          # independently waits for every peer's RPC port before loading
+          # (::_wait_for_rpc_workers), which also covers pod restarts.
+          startupProbe:
+            tcpSocket:
+              port: 50052
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 24
+      volumes:
+        - name: config
+          hostPath:
+            path: /etc/aureax
+            type: Directory
+        - name: data
+          hostPath:
+            path: /opt/aureax
+            type: DirectoryOrCreate

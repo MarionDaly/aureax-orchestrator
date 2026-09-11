@@ -1,0 +1,472 @@
+# ============================================================================
+# Aureax Shard Head Configuration — Prototype Template
+#
+# The head of a sharded model group. It runs llama-server with --rpc pointing
+# at the group's rpc-server workers, plus the MCP server, so the whole group
+# is addressable exactly like a single node:
+#
+#     MCP    https://<head>:30900/mcp
+#     llama  https://<head>:30800
+#
+# Only this node holds the GGUF; the workers receive tensors over the wire.
+#
+# TEMPLATE: the orchestrator substitutes ${...} from aureax-network.yaml.
+# ${rpc_servers} is injected as a real YAML list, built from the node_groups
+# block, so worker addresses are never hand-maintained here.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. NODE IDENTITY
+# ----------------------------------------------------------------------------
+node:
+  # Must stay "edge_executor": full_deploy() labels nodes by this literal
+  # role, so any other value means this node is never labelled and never
+  # gets a pod. Its head-ness comes from node_groups, not from the role.
+  id: "${node_id}"
+  role: "edge_executor"
+  display_name: "${display_name}"
+  tags: ${tags}
+
+  # MEASURED OFF ON THE HEAD. Pinning to the A76 cluster (cpu4-7) was worth
+  # nothing for decode (1.607 vs 1.602 tok/s pinned vs unpinned) and cost
+  # prefill 7% (0.80 vs 0.861 tok/s), measured live by re-running taskset
+  # against the same process.
+  #
+  # The likely reason is specific to the head: it is not only computing, it is
+  # staging every hidden-state handoff between workers and moving ~100 MiB per
+  # prefill batch. Confining the RPC I/O threads to the same four cores as the
+  # compute threads makes them contend, and prefill is where that shows.
+  #
+  # The worker case is different — see aureax-shard-worker.yaml, which keeps it.
+  cpu_affinity: []
+
+  # Injected from the group's node_groups entry. llama-server exits immediately
+  # if an RPC peer is unreachable at load time, so the supervisor blocks on every
+  # worker's port for this long before starting it.
+  worker_wait_timeout_seconds: ${worker_wait_timeout_seconds}
+
+# ----------------------------------------------------------------------------
+# 2. MODEL CONFIGURATION (llama.cpp, sharded over RPC)
+# ----------------------------------------------------------------------------
+model:
+  source: "local"
+  # 122B total / 10B active MoE. `filename` names PART 1 of a 3-part split GGUF;
+  # llama.cpp opens the other parts by name, so all three must be present in
+  # local_path. download-model.sh derives them from this name.
+  name: "Qwen3.5-122B-A10B"
+  filename: "Qwen3.5-122B-A10B-Q4_K_S-00001-of-00003.gguf"
+  # Q4_K_S, not the smaller UD-Q3_K_XL, and deliberately so: that file's routed
+  # experts are IQ3_XXS/IQ4_XS, and IQ3_XXS runs at ~16% of ARM NEON roofline
+  # against Q4_K's ~65% (its 1024-byte codebook needs scalar gathers, which NEON
+  # cannot vectorise). Q4_K_S reads more bytes per token and is still faster
+  # here — and it is the higher-quality quant. See the registry entry in
+  # aureax-network.yaml for the full numbers.
+  quantization: "Q4_K_S"
+  local_path: "/opt/aureax/models/"
+
+  server:
+    host: "0.0.0.0"
+    port: 8080
+
+    # Geometry, from the GGUF's own header (block_count 48, head_count_kv 2,
+    # key_length 256) — NOT the 64-layer/4-KV-head figure this comment carried
+    # before, which described a model that does not exist and overstated KV by
+    # roughly 10x.
+    #
+    # 48 layers, but only 12 are full attention: the pattern is 3 Gated-DeltaNet
+    # (linear attention) layers to 1 full-attention layer. Only the full-attention
+    # layers grow a KV cache, so KV is
+    #     12 layers x 2 KV heads x 256 head_dim x 2 (K+V) x 2 B = 24 KiB/token
+    # => ~96 MiB at 4096 ctx, not ~1 GiB. The 36 linear-attention layers instead
+    # hold a fixed-size recurrent state (~144 MiB total) that does not grow with
+    # context but is read AND written every step.
+    #
+    # Consequence for tuning: KV is ~5% of per-token bytes, so quantizing it or
+    # enabling flash attention buys almost nothing here. The cost is in the
+    # weights (see the quantization note on `filename` above).
+    #
+    # The model's native 262144 context is not reachable on this hardware.
+    context_size: 4096
+    batch_size: 512
+    parallel_slots: 1          # each slot multiplies KV
+
+    # REQUIRED for sharding. RPC devices are GPU-class devices, so with
+    # gpu_layers: 0 every layer stays on the head's own CPU and the workers
+    # sit idle while appearing perfectly healthy.
+    gpu_layers: 99
+
+    # 4x Cortex-A76 + 4x Cortex-A55. Spreading across all 8 makes the little
+    # cores the bottleneck; 4 keeps work on the big cluster.
+    threads: 4
+    threads_batch: 4
+
+    use_mlock: false
+    # Keep true. --no-mmap would turn a reclaimable page cache into a hard
+    # resident allocation on a 16 GB node with no swap. The head only holds
+    # its own share of a 71.7 GB model, but that share still exceeds what a
+    # non-reclaimable mapping can survive here.
+    use_mmap: true
+    flash_attention: false
+
+    # f16, deliberately, not the q4_0 used by small single-node models:
+    # recent llama.cpp refuses quantized KV without flash attention, and
+    # quantized KV widens exposure to the ne[0] % 512 assert class over RPC.
+    cache_type_k: "f16"
+    cache_type_v: "f16"
+
+    # Required by ChatLlamaClient, which the dashboard's chat tab uses against
+    # /v1/chat/completions. Matches the planner config.
+    #
+    # Qwen3.6 is a reasoning model: it emits a <think> block that llama.cpp
+    # surfaces as `reasoning_content`, so a short max_tokens can return an
+    # EMPTY `content` with finish_reason "length" — the model was still
+    # thinking. Give chat requests room (inference.max_tokens below), and note
+    # that client/inference/chat_client.py::strip_thinking already handles the
+    # inline <think> form returned by /completion.
+    jinja: true
+
+    # Prometheus /metrics, which client/telemetry/collector.py turns into
+    # tokens_per_second and prompt_tokens_per_second. Defaulted true in the
+    # schema; stated here because this is the node whose throughput is the
+    # thing under investigation.
+    metrics: true
+
+    # Keeps sampling on the compute device rather than shipping 248,320 f32
+    # logits (993 KB) back to the head over a blocking RPC round trip every
+    # token.
+    #
+    # Expect a small win, not a large one: the readback is ~1% of this model's
+    # per-token time budget, and llama.cpp silently falls back to host sampling
+    # for any request carrying tools or a json_schema — which `jinja: true`
+    # above makes common. Measure it rather than assuming it.
+    backend_sampling: true
+
+    # Cold load ships every tensor to the workers over the LAN. Measured at
+    # ~17 s/GB on this fleet (15.7 GB took 272 s), so this model's 71.7 GB is
+    # ~20 minutes. 2400s leaves margin for a slow first read off disk.
+    #
+    # RAISING THIS MEANS RAISING THE PROBE: the edge startupProbe budget in
+    # daemonset-edge.yaml must cover node.worker_wait_timeout_seconds + this.
+    health_timeout_seconds: 2400
+
+    # Injected from node_groups, one entry per worker in `workers:` order —
+    # currently seven, RPC0 through RPC6.
+    rpc_servers: ${rpc_servers}
+
+    # devices stays empty — the default enumeration in --rpc order is what we
+    # want, and naming devices explicitly would have to be re-checked against
+    # `llama-server --rpc ... --list-devices` on every build bump.
+    devices: []
+
+    # tensor_split is now EXPLICIT AND EVEN, one entry per worker.
+    #
+    # An empty list means llama.cpp splits proportionally to each device's
+    # advertised free memory, which on this fleet is measurably uneven: RSS
+    # across the seven workers ranged 6666-8849 MB against a 7719 MB mean, a
+    # 1.15x peak/mean spread. That was harmless at 57 GB. At Q4_K_S's 71.7 GB
+    # it is not: 71.7/7 = 10.24 GB mean, and a 1.15x peak lands near 11.8 GiB
+    # against the ~13.0 GiB these nodes actually have free — with NO SWAP, so
+    # overshoot is an instant OOM kill rather than a slowdown.
+    #
+    # Equal weights remove that risk and put every worker at ~10.24 GB.
+    #
+    # NOTE this list is ORDER-INDEPENDENT precisely because every entry is
+    # equal — the usual hazard (device ordering is positional, so a
+    # hand-written split silently starts addressing other machines) does not
+    # apply to a uniform split. It DOES apply the moment these values differ,
+    # so read --list-devices first if you ever make them uneven.
+    #
+    # One entry per worker: validate_groups enforces the length, so this list
+    # has to grow with the `workers:` list in aureax-network.yaml.
+    tensor_split: [1, 1, 1, 1, 1, 1, 1]
+
+  # --------------------------------------------------------------------------
+  # Speculative decoding. The 0.8B draft proposes tokens and the 122B verifies
+  # a batch of them in ONE forward pass, so the target's weights are read once
+  # per accepted batch instead of once per token.
+  #
+  # This is the right shape of win for THIS model: 78% of its per-token bytes
+  # are the always-on dense stack (Q8_0/Q6_K), and a batched verify reads that
+  # exactly once no matter how many tokens are in flight.
+  #
+  # Exactly lossless — rejection sampling reproduces the target's output
+  # distribution bit for bit. That is what makes it usable here where cutting
+  # `expert_used_count` is not.
+  #
+  # Tempering expectation: verifying t tokens activates the union of experts
+  # across them, 256*(1-(1-8/256)^t) per layer, so ~31 experts at n_max 4
+  # against 8 at n_max 1. Experts are only 22% of the bytes so it still pays,
+  # but raising n_max past ~4 buys progressively less. Measure before tuning.
+  #
+  # The draft must have a byte-identical vocabulary or llama-server refuses to
+  # load: Qwen3.5-0.8B is 248320, matching the 122B. See the registry entry in
+  # aureax-network.yaml.
+  # MEASURED OFF. Enabling this on 2026-08-13 produced, against an otherwise
+  # identical run: decode 1.607 tok/s vs 1.629 (unchanged, within noise) and
+  # prefill 0.80 tok/s vs 1.398 (a 43% REGRESSION, +9 s on a 17-token prompt).
+  # llama-server logged `loading draft model` and then no acceptance statistics
+  # at all, so the draft was being paid for and not used.
+  #
+  # Two candidate causes, neither yet confirmed: `--backend-sampling` keeps the
+  # target's logits on-device while the verify step wants them on the host, and
+  # p_min 0.6 may reject every draft outright. Both are testable by flipping one
+  # at a time; until one of them is shown to fix it, this is pure cost.
+  #
+  # The implementation and the draft GGUF both stay — re-enable and re-measure
+  # after the quant swap, when the target's per-token cost has changed.
+  draft:
+    enabled: false
+    filename: "Qwen3.5-0.8B-Q4_K_M.gguf"
+    n_max: 4
+    n_min: 1
+    p_min: 0.6
+    # MUST stay 0. The target's layers live on RPC devices; if the draft
+    # followed them there, its weights would be shipped over the LAN and every
+    # drafted token would cost network hops — the opposite of the point.
+    gpu_layers: 0
+    # The head's own cores are idle while the workers compute, so the draft
+    # runs for free in that window. `node.cpu_affinity` above is empty, so
+    # nothing pins these threads to the big cluster — this count is the only
+    # bound on them.
+    threads: 4
+
+# ----------------------------------------------------------------------------
+# 3. AGENT PROMPT & PERSONA
+# ----------------------------------------------------------------------------
+agent:
+  system_prompt: |
+    You are an Aureax edge agent running on ${display_name}, backed by a
+    122B model sharded across a group of edge nodes. Your role is to monitor
+    sensor data, detect anomalies, and produce structured reports for the
+    central orchestrator.
+
+    CONSTRAINTS:
+    - Be concise. Generation is distributed and comparatively slow.
+    - When asked to analyze sensor data, provide clear assessments.
+    - Report anomalies with severity levels: low, medium, high, critical.
+
+  agent_name: "${node_id}"
+  agent_description: "Sharded-model edge agent (group ${group_id})"
+
+# ----------------------------------------------------------------------------
+# 4. MCP CONFIGURATION
+# ----------------------------------------------------------------------------
+mcp:
+  server:
+    enabled: true
+    transport: "streamable-http"
+    port: 9000
+
+    # RESERVED — documentation only. The edge server registers its tools in
+    # code with @mcp.tool() decorators (client/mcp/server.py) and never reads
+    # this block, so editing it neither adds, removes nor renames a tool. Kept
+    # as the readable inventory of what this group exposes through its head; a
+    # future register-from-config or tool-filtering story would consume it.
+    tools:
+      - name: "get_health"
+        description: "Get node health status including llama-server and system metrics"
+        input_schema:
+          type: "object"
+          properties: {}
+
+      - name: "get_metrics"
+        description: "Get collected telemetry metrics from this node"
+        input_schema:
+          type: "object"
+          properties:
+            since_minutes:
+              type: "integer"
+              description: "Return metrics from the last N minutes"
+          required: []
+
+      - name: "run_inference"
+        description: "Send a prompt to the sharded LLM and get a response"
+        input_schema:
+          type: "object"
+          properties:
+            prompt:
+              type: "string"
+              description: "The prompt to send to the LLM"
+            max_tokens:
+              type: "integer"
+              description: "Maximum tokens to generate"
+            temperature:
+              type: "number"
+              description: "Sampling temperature"
+          required: ["prompt"]
+
+      - name: "read_sensor"
+        description: "Read current values from a simulated IoT sensor"
+        input_schema:
+          type: "object"
+          properties:
+            sensor_type:
+              type: "string"
+              enum: ["temperature", "humidity", "pressure", "light", "battery", "all"]
+              description: "Which sensor to read"
+          required: ["sensor_type"]
+
+      - name: "get_sensor_status"
+        description: "Get operational status of all simulated sensors"
+        input_schema:
+          type: "object"
+          properties: {}
+
+      - name: "report_anomaly"
+        description: "Report a detected anomaly for orchestrator review"
+        input_schema:
+          type: "object"
+          properties:
+            sensor_type:
+              type: "string"
+              description: "Sensor that detected the anomaly"
+            severity:
+              type: "string"
+              enum: ["low", "medium", "high", "critical"]
+            description:
+              type: "string"
+              description: "Description of the anomaly"
+            value:
+              type: "number"
+              description: "The anomalous sensor value"
+          required: ["sensor_type", "severity", "description"]
+
+  client:
+    enabled: false
+
+# ----------------------------------------------------------------------------
+# 5. TELEMETRY & METRICS
+# ----------------------------------------------------------------------------
+telemetry:
+  enabled: true
+
+  local:
+    db_path: "/opt/aureax/metrics/telemetry.db"
+    # RESERVED — these lists are documentation, not a filter. collect_all()
+    # gathers system metrics always, plus inference metrics whenever the node
+    # has a llama-server to poll — it never consults this block. Kept accurate
+    # so it describes what actually arrives; do not expect editing it to
+    # change anything.
+    collect:
+      inference:
+        - "prompt_tokens"
+        - "completion_tokens"
+        - "tokens_per_second"
+        - "total_inference_time_ms"
+      system:
+        - "cpu_percent"
+        - "memory_percent"
+        - "disk_usage_percent"
+        - "temperature_c"
+      agent:
+        - "tasks_completed"
+        - "tasks_failed"
+        - "anomalies_detected"
+        - "queue_depth"
+    sample_interval_seconds: 60
+    retention_days: 7
+    # RESERVED — unenforced. retention_days above, plus the 3x hard cutoff on
+    # unpushed rows in TelemetryStorage.rotate(), is what actually bounds the
+    # local buffer.
+    max_db_size_mb: 50
+
+  remote:
+    # RESERVED — jsonl over HTTP is the only transport implemented.
+    protocol: "jsonl_http"
+    # ONE OF THE TWO VALUES THIS FROZEN ROLLBACK FILE HAS EDITED (the other is
+    # the health_check endpoint under process.managed_services below). TLS is
+    # mandatory fleet-wide and the dashboard has no plaintext listener left, so
+    # a rollback that kept http:// here would come up unable to reach the
+    # orchestrator at all. Transport-wide changes only; never anything
+    # model-shaped (see ARCHITECTURE.md, "A frozen rollback target...").
+    endpoint: "${orchestrator_url}/api/v1/telemetry"
+    batch_size: 50
+    push_interval_seconds: 60
+    # RESERVED — batches are sent uncompressed.
+    compress: false
+    retry:
+      max_attempts: 3
+      backoff_base_seconds: 30
+      backoff_max_seconds: 300
+
+# ----------------------------------------------------------------------------
+# 6. PROCESS MANAGEMENT
+# ----------------------------------------------------------------------------
+process:
+  # RESERVED — managed_services and shutdown_order are descriptive only. The
+  # supervisor picks its child from node.role (client/entrypoint.py), not from
+  # this list, and tears down the one child it spawned. Only
+  # shutdown_timeout_seconds is read. The nested health_check is reserved for
+  # the same reason: liveness and readiness come from the DaemonSet's probes
+  # (k8s/daemonset-edge.yaml). Kept as documentation of intent; do not expect
+  # editing the list to change what runs.
+  managed_services:
+    - name: "llama-server"
+      type: "llama_cpp"
+      restart_policy: "always"
+      max_restarts: 10
+      restart_delay_seconds: 5
+      health_check:
+        # The second and last VALUE this frozen file has edited — same reason
+        # as the telemetry endpoint above: transport, never model shape.
+        # Comments have moved since: the header's two endpoint lines went to
+        # https and the storage note dropped a pointer to a file that is not
+        # published. Comment-only, so what a rollback SERVES is still frozen.
+        endpoint: "https://127.0.0.1:8080/health"
+        interval_seconds: 30
+        timeout_seconds: 5
+        unhealthy_threshold: 3
+
+    - name: "mcp-server"
+      type: "mcp"
+      restart_policy: "always"
+      max_restarts: 10
+      restart_delay_seconds: 3
+
+  shutdown_order: ["mcp-server", "llama-server"]
+  shutdown_timeout_seconds: 30
+
+# ----------------------------------------------------------------------------
+# 7. STORAGE & PATHS
+# ----------------------------------------------------------------------------
+# RESERVED, the whole block — nothing reads any of these paths; every use site
+# hardcodes its own. Note in particular that models_path does NOT place the
+# GGUF: model.local_path above is what does. Kept as reserved for a future
+# platform-aware storage layout; until then, changing a path here moves
+# nothing.
+storage:
+  base_path: "/opt/aureax"
+  models_path: "/opt/aureax/models"
+  logs_path: "/opt/aureax/logs"
+  queue_path: "/opt/aureax/mcp/queue"
+  metrics_path: "/opt/aureax/metrics"
+  tmp_path: "/tmp/aureax"
+
+# ----------------------------------------------------------------------------
+# 8. LOGGING
+# ----------------------------------------------------------------------------
+logging:
+  # RESERVED, all six below — level, format, output, file_path,
+  # max_file_size_mb and max_files are unread. The supervisor logs through
+  # logging.basicConfig and caps the managed child's log at a fixed 100 MB
+  # with one rotated predecessor (client/entrypoint.py::_CappedLogFile), so
+  # nothing here selects a level, a format, a destination or a rotation
+  # policy — in particular max_file_size_mb/max_files do NOT size or count
+  # that rotation. llama_log_path is the exception: it IS read, and names the
+  # llama-server log this node's child writes.
+  level: "info"
+  format: "json"
+  output: "both"
+  file_path: "/opt/aureax/logs/aureax-client.log"
+  max_file_size_mb: 50
+  max_files: 3
+  llama_log_path: "/opt/aureax/logs/llama-server.log"
+
+# ----------------------------------------------------------------------------
+# 9. DEPLOYMENT METADATA (set by orchestrator, read-only on client)
+# ----------------------------------------------------------------------------
+deployment:
+  deployed_at: null
+  deployed_by: null
+  config_version: null
+  config_hash: null

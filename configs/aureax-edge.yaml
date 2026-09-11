@@ -1,0 +1,353 @@
+# ============================================================================
+# Aureax Edge Agent Configuration — Prototype Template
+#
+# This is a TEMPLATE. The orchestrator generates per-node copies by
+# substituting ${...} placeholders with values from aureax-network.yaml.
+#
+# The full placeholder set (orchestrator/config/templating.py::build_variables,
+# cited by symbol so this survives edits to that file):
+#
+#   ${node_id} ${display_name} ${tags}   from this node's ssh.targets entry
+#   ${orchestrator_ip}                   the --orchestrator-ip value, IPv6-bracketed
+#   ${orchestrator_url}                  https://<that host>:<server.dashboard.port>
+#   ${group_id} ${rpc_servers} ${worker_wait_timeout_seconds}   from node_groups
+#   ${mcp_endpoints}                     every OTHER enabled node that serves MCP
+#   ${api_key}                           this node's llama-server bearer key
+#   ${mcp_api_key}                       this node's MCP bearer key
+#
+# The orchestrator also STAMPS a `tls:` block onto every generated config
+# (ca_file/cert_file/key_file under /etc/aureax/tls). It is not a placeholder
+# and must not be written here: TLS is mandatory fleet-wide, so a template that
+# could forget it would ship a node that cannot start.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. NODE IDENTITY
+# ----------------------------------------------------------------------------
+node:
+  id: "${node_id}"
+  role: "edge_executor"
+  display_name: "${display_name}"
+  tags: ${tags}
+
+# ----------------------------------------------------------------------------
+# 2. MODEL CONFIGURATION (llama.cpp)
+# ----------------------------------------------------------------------------
+model:
+  source: "local"
+  name: "Qwen3.5-4B-Instruct"
+  filename: "Qwen3.5-4B-Q4_K_M.gguf"
+  quantization: "Q4_K_M"
+  local_path: "/opt/aureax/models/"
+
+  server:
+    host: "0.0.0.0"
+    port: 8080
+    context_size: 4096
+    batch_size: 512
+    parallel_slots: 1
+    gpu_layers: 0
+    threads: 4
+    threads_batch: 4
+    use_mlock: false
+    use_mmap: true
+    # "auto" hands the decision to llama.cpp's own probe. --flash-attn is
+    # emitted on every launch, so this value is what llama-server acts on; set
+    # true or false to decide explicitly instead.
+    flash_attention: "auto"
+    # f16, not q4_0. Recent llama.cpp REFUSES quantized KV when flash attention
+    # is off, and refuses it at startup — so this pairing does not degrade,
+    # it fails to boot. Same reasoning, and the same resolution, as
+    # configs/aureax-shard-head.yaml.
+    #
+    # The memory this costs is small here: a 4B model at the 4096 context above
+    # is a few hundred MB of KV. If you need q4_0 back, turn flash_attention on
+    # in the same edit and verify the node actually starts — the two settings
+    # are not independent.
+    cache_type_k: "f16"
+    cache_type_v: "f16"
+
+    # Required by ChatLlamaClient, which the dashboard's chat tab uses against
+    # /v1/chat/completions — llama.cpp rejects a request carrying `tools`
+    # without --jinja. The schema default is false, so a template that wants a
+    # working chat tab has to say so here.
+    #
+    # It matters for this node's own MCP `run_inference` too, which now goes
+    # through LlamaClient against the same /v1/chat/completions endpoint
+    # (client/inference/llama_client.py): without --jinja llama.cpp falls back
+    # to a generic built-in template instead of the GGUF's own, which is the
+    # difference between an answer and a stream of repeated fragments on a
+    # model that ships control tokens in its template.
+    # Matches the planner and shard-head configs.
+    jinja: true
+
+    # Bearer auth for this node's llama-server — :8080 inside the pod, :30800
+    # off it. ${api_key} resolves at generate time to THIS node's own key from
+    # ~/.aureax/keys/<node_id>.key on the orchestrator, created automatically
+    # the first time a template asks for one and never enters git. The key
+    # reaches llama-server through the LLAMA_API_KEY environment variable, not
+    # argv, so it stays out of `ps` and out of shipped logs.
+    #
+    # /health, /v1/health, /models, /v1/models and the web-UI assets stay
+    # PUBLIC — the k8s probes and a harness's model-discovery call depend on
+    # that. /props, /metrics, /slots, /completion and every /v1/* inference
+    # route answer 401 without `Authorization: Bearer <key>`.
+    #
+    # TO DISABLE AUTH: delete this line. An absent api_key is no auth at all —
+    # which is how the frozen 122B rollback configs stay open without an edit.
+    api_key: "${api_key}"
+
+    # llama.cpp's embedded web UI at "/". Stated rather than left to the schema
+    # default so the toggle is discoverable: false emits --no-webui, and that
+    # is the only thing that removes the surface — the UI's own assets are
+    # exempt from api_key auth by design (the page loads, then prompts for the
+    # key).
+    webui: true
+
+    # Three more model.server knobs, all documented in
+    # orchestrator/config/schema.py: `slots: true` re-enables the /slots
+    # diagnostic endpoint (off by default — it exposes the prompt and response
+    # text of every in-flight request), `cors_origins` sets --cors-origins, and
+    # `alias` names the model id /v1/models reports instead of the GGUF path.
+
+# ----------------------------------------------------------------------------
+# 3. AGENT PROMPT & PERSONA
+# ----------------------------------------------------------------------------
+agent:
+  system_prompt: |
+    You are an IoT edge agent deployed on ${display_name}. Your role is to
+    monitor sensor data, detect anomalies, and produce structured reports
+    for the central orchestrator.
+
+    CONSTRAINTS:
+    - Be concise. You are running on constrained hardware.
+    - When asked to analyze sensor data, provide clear assessments.
+    - Report anomalies with severity levels: low, medium, high, critical.
+
+  agent_name: "${node_id}"
+  agent_description: "Generic IoT edge agent for sensor monitoring and anomaly detection"
+
+# ----------------------------------------------------------------------------
+# 4. MCP CONFIGURATION
+# ----------------------------------------------------------------------------
+mcp:
+  server:
+    enabled: true
+    transport: "streamable-http"
+    port: 9000
+
+    # Bearer auth for this node's MCP server — :9000 inside the pod, :30900 off
+    # it. Exactly one line turns it on, mirroring model.server.api_key above:
+    # ${mcp_api_key} resolves at generate time to THIS node's own key from
+    # ~/.aureax/keys/<node_id>.mcp.key on the orchestrator, created the first
+    # time a template asks for one and never entering git. Unlike the llama key
+    # there is no environment variable at all — the MCP server runs inside the
+    # supervisor process, so the resolved config is the only path in.
+    #
+    # /health stays PUBLIC: mcp_health_wait in scripts/lib/common.sh, setup-all
+    # and update-all all poll it unauthenticated. Everything else, /mcp
+    # included, answers 401 without `Authorization: Bearer <key>`.
+    #
+    # TO DISABLE AUTH: delete this line. An absent api_key is no check at all,
+    # which leaves run_inference — and through it this node's key-protected
+    # llama-server — reachable by anything that can reach the port.
+    api_key: "${mcp_api_key}"
+
+    # RESERVED — documentation only. The edge server registers its tools in
+    # code with @mcp.tool() decorators (client/mcp/server.py) and never reads
+    # this block, so editing it neither adds, removes nor renames a tool. Kept
+    # as the readable inventory of what this node exposes; a future
+    # register-from-config or tool-filtering story is what would consume it.
+    tools:
+      - name: "get_health"
+        description: "Get node health status including llama-server and system metrics"
+        input_schema:
+          type: "object"
+          properties: {}
+
+      - name: "get_metrics"
+        description: "Get collected telemetry metrics from this node"
+        input_schema:
+          type: "object"
+          properties:
+            since_minutes:
+              type: "integer"
+              description: "Return metrics from the last N minutes"
+          required: []
+
+      - name: "run_inference"
+        description: "Send a prompt to the local LLM and get a response"
+        input_schema:
+          type: "object"
+          properties:
+            prompt:
+              type: "string"
+              description: "The prompt to send to the LLM"
+            max_tokens:
+              type: "integer"
+              description: "Maximum tokens to generate"
+            temperature:
+              type: "number"
+              description: "Sampling temperature"
+          required: ["prompt"]
+
+      - name: "read_sensor"
+        description: "Read current values from a simulated IoT sensor"
+        input_schema:
+          type: "object"
+          properties:
+            sensor_type:
+              type: "string"
+              enum: ["temperature", "humidity", "pressure", "light", "battery", "all"]
+              description: "Which sensor to read"
+          required: ["sensor_type"]
+
+      - name: "get_sensor_status"
+        description: "Get operational status of all simulated sensors"
+        input_schema:
+          type: "object"
+          properties: {}
+
+      - name: "report_anomaly"
+        description: "Report a detected anomaly for orchestrator review"
+        input_schema:
+          type: "object"
+          properties:
+            sensor_type:
+              type: "string"
+              description: "Sensor that detected the anomaly"
+            severity:
+              type: "string"
+              enum: ["low", "medium", "high", "critical"]
+            description:
+              type: "string"
+              description: "Description of the anomaly"
+            value:
+              type: "number"
+              description: "The anomalous sensor value"
+          required: ["sensor_type", "severity", "description"]
+
+  client:
+    enabled: false
+
+# ----------------------------------------------------------------------------
+# 5. TELEMETRY & METRICS
+# ----------------------------------------------------------------------------
+telemetry:
+  enabled: true
+
+  local:
+    db_path: "/opt/aureax/metrics/telemetry.db"
+    # RESERVED — documentation, not a filter; collect_all() never consults it.
+    # See TelemetryLocal in orchestrator/config/schema.py.
+    collect:
+      inference:
+        - "prompt_tokens"
+        - "completion_tokens"
+        - "tokens_per_second"
+        - "total_inference_time_ms"
+      system:
+        - "cpu_percent"
+        - "memory_percent"
+        - "disk_usage_percent"
+        - "temperature_c"
+      agent:
+        - "tasks_completed"
+        - "tasks_failed"
+        - "anomalies_detected"
+        - "queue_depth"
+    sample_interval_seconds: 60
+    retention_days: 7
+    # RESERVED — unenforced; see TelemetryLocal in
+    # orchestrator/config/schema.py for what actually bounds the buffer.
+    max_db_size_mb: 50
+
+  remote:
+    # RESERVED — jsonl over HTTP is the only transport implemented.
+    protocol: "jsonl_http"
+    # 7001 is the dashboard's ingest port: the receiver is mounted on the
+    # dashboard app (orchestrator/dashboard/api.py::POST /api/v1/telemetry),
+    # and nothing listens on any other. A node pointed elsewhere pushes into
+    # the void — the sender logs a failed POST and carries on.
+    endpoint: "${orchestrator_url}/api/v1/telemetry"
+    batch_size: 50
+    push_interval_seconds: 60
+    # RESERVED — batches are sent uncompressed.
+    compress: false
+    retry:
+      max_attempts: 3
+      backoff_base_seconds: 30
+      backoff_max_seconds: 300
+
+# ----------------------------------------------------------------------------
+# 6. PROCESS MANAGEMENT
+# ----------------------------------------------------------------------------
+process:
+  # RESERVED except shutdown_timeout_seconds — managed_services,
+  # shutdown_order and the nested health_check are documentation of intent;
+  # see ProcessConfig and the note above HealthCheck in
+  # orchestrator/config/schema.py. The supervisor picks its one child from
+  # node.role (client/entrypoint.py), and liveness/readiness come from the
+  # DaemonSet's probes (k8s/daemonset-edge.yaml).
+  managed_services:
+    - name: "llama-server"
+      type: "llama_cpp"
+      restart_policy: "always"
+      max_restarts: 10
+      restart_delay_seconds: 5
+      health_check:
+        endpoint: "https://127.0.0.1:8080/health"
+        interval_seconds: 30
+        timeout_seconds: 5
+        unhealthy_threshold: 3
+
+    - name: "mcp-server"
+      type: "mcp"
+      restart_policy: "always"
+      max_restarts: 10
+      restart_delay_seconds: 3
+
+  shutdown_order: ["mcp-server", "llama-server"]
+  shutdown_timeout_seconds: 30
+
+# ----------------------------------------------------------------------------
+# 7. STORAGE & PATHS
+# ----------------------------------------------------------------------------
+# RESERVED, the whole block — nothing reads any of these paths; every use site
+# hardcodes its own (StorageConfig in orchestrator/config/schema.py). Kept as
+# reserved for a future platform-aware storage layout; until then, changing a
+# path here moves nothing.
+storage:
+  base_path: "/opt/aureax"
+  models_path: "/opt/aureax/models"
+  logs_path: "/opt/aureax/logs"
+  queue_path: "/opt/aureax/mcp/queue"
+  metrics_path: "/opt/aureax/metrics"
+  tmp_path: "/tmp/aureax"
+
+# ----------------------------------------------------------------------------
+# 8. LOGGING
+# ----------------------------------------------------------------------------
+logging:
+  # RESERVED except llama_log_path — the read/unread split, and the five
+  # ACTIVE fields no template sets (so every node runs them on their schema
+  # defaults, which is why warn/error lines reach the orchestrator without
+  # anything here saying so), are documented on LoggingConfig in
+  # orchestrator/config/schema.py. llama_log_path IS read: it names the
+  # llama-server log this node's child writes.
+  level: "info"
+  format: "json"
+  output: "both"
+  file_path: "/opt/aureax/logs/aureax-client.log"
+  max_file_size_mb: 50
+  max_files: 3
+  llama_log_path: "/opt/aureax/logs/llama-server.log"
+
+# ----------------------------------------------------------------------------
+# 9. DEPLOYMENT METADATA (set by orchestrator, read-only on client)
+# ----------------------------------------------------------------------------
+deployment:
+  deployed_at: null
+  deployed_by: null
+  config_version: null
+  config_hash: null

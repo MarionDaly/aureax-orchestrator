@@ -1,0 +1,81 @@
+[project]
+name = "aureax"
+version = "0.1.0"
+description = "Aureax AI orchestration prototype — orchestrator + edge client"
+requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Marion Miranda" }]
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: POSIX",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+    "click>=8.3.3",
+    "cryptography>=50.0.1",
+    "fastapi>=0.135.2",
+    "httpx>=0.28.1",
+    "mcp>=1.28.1,<2",
+    "paramiko>=5.0.0",
+    "pydantic>=2.12.5",
+    "ruamel-yaml>=0.19.1",
+    "starlette>=1.3.1",
+    "uvicorn>=0.31.1",
+]
+
+[project.scripts]
+aureax = "orchestrator.cli:main"
+aureax-harness = "orchestrator.harness.cli:main"
+
+[build-system]
+# 77 is the first setuptools that understands the PEP 639 string `license`
+# and `license-files` above.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.9.0",
+    "vulture>=2.14",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.setuptools.cmdclass]
+build_py = "build_support.BuildPy"
+
+[tool.setuptools.package-data]
+"orchestrator.dashboard" = ["static/**/*", "static/*"]
+
+[tool.setuptools.packages.find]
+include = ["orchestrator*", "client*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",
+    "I",
+    "B",
+    "UP",
+    "SIM",
+    "RUF",
+]
+ignore = [
+    "E501",
+]
+
+[tool.vulture]
+paths = ["orchestrator", "client"]
+min_confidence = 80
+exclude = ["orchestrator/dashboard/static/"]
+ignore_decorators = ["@router.*", "@cli.*", "@click.*", "@mcp.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

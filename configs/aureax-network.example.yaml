@@ -1,0 +1,515 @@
+# ============================================================================
+# Aureax Network Configuration (Orchestrator Level) — EXAMPLE
+#
+# Copy this file to configs/aureax-network.yaml (gitignored, because the real
+# one carries SSH credentials and real addresses) and edit it for your fleet:
+#
+#     cp configs/aureax-network.example.yaml configs/aureax-network.yaml
+#
+# The addresses below are from the 192.0.2.0/24 documentation range and the
+# fleet shape (two sharded groups of four ARM64 nodes plus one GPU planner) is
+# the one the README and ARCHITECTURE.md describe. A smaller fleet is fine —
+# the README shows a two-node standalone configuration.
+#
+# Lives ONLY on the orchestrator. Defines the entire deployment.
+# ============================================================================
+
+network:
+  name: "aureax-prototype"
+  version: "0.1.0"
+  description: "Aureax prototype — two 4-node sharded groups (1 head + 3 workers each) + cognitive planner"
+
+# ----------------------------------------------------------------------------
+# Global defaults — DOCUMENTATION ONLY, not a mechanism.
+#
+# Nothing merges this block into a per-node config. Each per-node YAML sets
+# these values itself; that is the whole point of the per-node-config pattern
+# (see ARCHITECTURE.md, "2. Configuration: per-node files, not one shared
+# template"). Kept because it records the intended values in one place and
+# matches the production reference — but changing something here does NOT
+# change any node. Change the per-node file.
+#
+# ${orchestrator_url} below is one of the placeholders the per-node templates
+# resolve (orchestrator/config/templating.py::build_variables). It expands to
+# https://<--orchestrator-ip>:<server.dashboard.port>, so a fleet that moves
+# the dashboard off 7001 needs no template edit. The full set is
+# ${node_id} ${display_name} ${tags} ${orchestrator_ip} ${orchestrator_url}
+# ${group_id} ${rpc_servers} ${worker_wait_timeout_seconds} ${mcp_endpoints}
+# ${api_key} ${mcp_api_key} — the last being the node's own MCP bearer key,
+# turned on by one `api_key: ${mcp_api_key}` line under mcp.server. Certificate
+# paths are NOT a placeholder: the orchestrator stamps a `tls:` block onto
+# every generated config.
+# ----------------------------------------------------------------------------
+defaults:
+  model:
+    local_path: "/opt/aureax/models/"
+  telemetry:
+    remote:
+      endpoint: "${orchestrator_url}/api/v1/telemetry"
+      protocol: "jsonl_http"
+      compress: false
+  storage:
+    base_path: "/opt/aureax"
+
+# ----------------------------------------------------------------------------
+# SSH targets — how the orchestrator reaches each node
+# ----------------------------------------------------------------------------
+ssh:
+  # NOTE: there is no `default_user` / `default_port` here. Each target carries
+  # its own `user` and `port` (defaults: "aureax", 22); nothing reads a
+  # file-level default, so adding one here would silently do nothing.
+  # Directory a target's relative `key_file` is resolved against
+  # (orchestrator/deploy/ssh.py::resolve_key_path). Points at the operator's
+  # existing ~/.ssh rather than a store this repo would have to populate — the
+  # orchestrator authenticates with the same identity whose public half
+  # `bootstrap_public_key` below installs on each node.
+  key_store: "~/.ssh/"
+  connect_timeout_seconds: 15
+
+  # Installed on a node the first time we authenticate with a password. The
+  # bash scripts only ever speak `ssh -i <key>`, so this is what keeps them
+  # working against nodes that ship with only a factory password.
+  bootstrap_public_key: "~/.ssh/id_ed25519.pub"
+
+  targets:
+    # ---- shard groups "qwen35b-a" and "qwen35b-b" — 1 head + 3 workers each --
+    # Two independent agents over the eight ARM units, not one group of eight.
+    # Group membership lives in node_groups below; the only thing that
+    # distinguishes a head here is its config_file, which sets role
+    # edge_executor and enables the MCP server.
+    #
+    # In this example all eight are the same ARM64 board (8 cores, ~15 GiB
+    # usable, 1 GbE, no swap). Keep a group homogeneous: every peer must run
+    # the byte-identical llama.cpp build, and one ARM baseline
+    # (armv8.2-a+fp16+dotprod) then covers all of them.
+    #
+    # Password-only nodes: `password_env` names an environment variable read at
+    # connect time (export it in the shell that runs `aureax`), so the secret
+    # stays out of this file. A literal `password: "..."` is also accepted.
+    # Either way the first password-authenticated connect installs
+    # `bootstrap_public_key` above, and `key_file` takes over from then on.
+    - node_id: "shard-head"
+      host: 192.0.2.10
+      port: 22
+      user: "aureax"
+      password_env: "AUREAX_SSH_PASSWORD"
+      key_file: "id_ed25519"
+      config_file: "aureax-shard-head-35b.yaml"
+      display_name: "Shard Head A"
+      tags: ["shard", "qwen35b-a", "head"]
+
+    - node_id: "shard-a1"
+      host: 192.0.2.11
+      port: 22
+      user: "aureax"
+      password_env: "AUREAX_SSH_PASSWORD"
+      key_file: "id_ed25519"
+      config_file: "aureax-shard-worker-35b.yaml"
+      display_name: "Shard Worker A1"
+      tags: ["shard", "qwen35b-a", "worker"]
+
+    - node_id: "shard-a2"
+      host: 192.0.2.12
+      port: 22
+      user: "aureax"
+      password_env: "AUREAX_SSH_PASSWORD"
+      key_file: "id_ed25519"
+      config_file: "aureax-shard-worker-35b.yaml"
+      display_name: "Shard Worker A2"
+      tags: ["shard", "qwen35b-a", "worker"]
+
+    - node_id: "shard-a3"
+      host: 192.0.2.13
+      port: 22
+      user: "aureax"
+      password_env: "AUREAX_SSH_PASSWORD"
+      key_file: "id_ed25519"
+      config_file: "aureax-shard-worker-35b.yaml"
+      display_name: "Shard Worker A3"
+      tags: ["shard", "qwen35b-a", "worker"]
+
+    # A HEAD, and its config_file is the only thing here that says so — the
+    # role comes from the per-node config, not from this entry.
+    #
+    # CHANGING A NODE'S ROLE in either direction means a K8s label has to be
+    # REMOVED as well as added: node.role "edge_executor" takes
+    # aureax.io/role=edge and must LOSE aureax.io/shard=worker, or the node
+    # matches both DaemonSet selectors and runs llama-server and rpc-server at
+    # once. Deployer.label_nodes and label_shard_workers each strip the
+    # opposite label, and only `deploy` runs them — `aureax start` does not push
+    # configs, so it cannot see a role change.
+    - node_id: "shard-head-b"
+      host: 192.0.2.20
+      port: 22
+      user: "aureax"
+      password_env: "AUREAX_SSH_PASSWORD"
+      key_file: "id_ed25519"
+      config_file: "aureax-shard-head-35b.yaml"
+      display_name: "Shard Head B"
+      tags: ["shard", "qwen35b-b", "head"]
+
+    - node_id: "shard-b1"
+      host: 192.0.2.21
+      port: 22
+      user: "aureax"
+      password_env: "AUREAX_SSH_PASSWORD"
+      key_file: "id_ed25519"
+      config_file: "aureax-shard-worker-35b.yaml"
+      display_name: "Shard Worker B1"
+      tags: ["shard", "qwen35b-b", "worker"]
+
+    - node_id: "shard-b2"
+      host: 192.0.2.22
+      port: 22
+      user: "aureax"
+      password_env: "AUREAX_SSH_PASSWORD"
+      key_file: "id_ed25519"
+      config_file: "aureax-shard-worker-35b.yaml"
+      display_name: "Shard Worker B2"
+      tags: ["shard", "qwen35b-b", "worker"]
+
+    - node_id: "shard-b3"
+      host: 192.0.2.23
+      port: 22
+      user: "aureax"
+      password_env: "AUREAX_SSH_PASSWORD"
+      key_file: "id_ed25519"
+      config_file: "aureax-shard-worker-35b.yaml"
+      display_name: "Shard Worker B3"
+      tags: ["shard", "qwen35b-b", "worker"]
+
+    # To keep a node documented here without deploying to it, set
+    # `enabled: false` on its entry rather than commenting it out: disabled
+    # targets are skipped by every SSH preflight, label pass, pod-count wait
+    # and config-generation run, but still validate.
+
+    - node_id: "planner-01"
+      host: 192.0.2.30
+      port: 22
+      user: "aureax"
+      key_file: "id_ed25519"
+      config_file: "aureax-planner.yaml"
+      display_name: "Cognitive Planner"
+      tags: ["planner", "mcp-host"]
+      # x86_64 with NVIDIA GPUs — the only node in the fleet that builds from
+      # Dockerfile.client.cuda.
+      enabled: true
+
+# ----------------------------------------------------------------------------
+# Node groups — several nodes cooperatively serving ONE model
+# ----------------------------------------------------------------------------
+# The head runs llama-server (with --rpc pointing at the workers) plus the MCP
+# server, so each group is addressed exactly like a single node:
+#     group A   MCP https://192.0.2.10:30900/mcp   llama https://192.0.2.10:30800
+#     group B   MCP https://192.0.2.20:30900/mcp   llama https://192.0.2.20:30800
+# Workers run only llama.cpp's rpc-server and hold their share of the weights.
+# `uv run aureax group list` prints both.
+#
+# TWO GROUPS OF FOUR, not one of eight. The eight ARM units serve two
+# independent Qwen3.5-35B-A3B agents, 1 head + 3 workers each, because a 22 GB
+# model does not need eight nodes: ~6.9 GiB of weights per worker against
+# ~13.0 GiB free leaves room for a 131072-token context. Splitting also halves
+# the per-group RPC fan-out, which matters more than it looks — see the mask
+# broadcast note below.
+#
+# The planner picks both up automatically: ${mcp_endpoints} resolves to every
+# enabled target whose own config has mcp.server.enabled, so nothing lists
+# these two endpoints by hand.
+#
+# LAN NOTE. Both groups share one switch. The attention mask is re-sent to
+# every worker on every graph compute with no dirty tracking, so at a filled
+# 128k context each decoded token broadcasts ~16.8 MiB per worker — ~50 MiB per
+# group per token. That term is linear in worker count and quadratic in
+# context, and it shows up as "slower the longer the conversation", never as an
+# error. Three workers per group rather than seven is what keeps it tolerable.
+# Measure with ifstat on a head at a filled context before trusting 128k for
+# long sessions; context_size 32768 is the fallback.
+#
+# SECURITY: rpc-server has no authentication and deserializes arbitrary tensor
+# graphs. Port 50052 must stay on a trusted LAN, firewalled to the head's IP.
+# Never expose it to a routable network.
+node_groups:
+  # ORDER MATTERS inside each `workers:` list: it is the --rpc order, which
+  # defines the device names RPC0, RPC1, RPC2 that `devices` and `tensor_split`
+  # index positionally. APPEND new workers — reordering renames every device, so
+  # a hand-written tensor_split would silently start addressing other machines.
+  #
+  # Both groups have exactly three workers, which is what lets them share one
+  # head config file: tensor_split there is [1, 1, 1] and validate_groups
+  # enforces len(tensor_split) == len(workers) per group. Resizing ONE group
+  # means giving it its own head config.
+  #
+  # ROLLING BACK TO THE 122B IS NOT JUST THE EIGHT config_file LINES — this
+  # block has to be restored as well. aureax-shard-head.yaml (the frozen
+  # rollback target) carries tensor_split with seven entries, because the 122B
+  # runs as ONE group of 1 head + 7 workers; validate_groups length-checks that
+  # against each group's worker count, so pointing it at a 3-worker group aborts
+  # `aureax generate` before anything reaches a node. A revert therefore means:
+  # collapse these two entries back into ONE group headed by shard-head, with
+  # its seven workers in the order shard-a1, shard-a2, shard-a3, shard-head-b,
+  # shard-b1, shard-b2, shard-b3 — shard-head-b becoming a worker, which is a
+  # role change with the label consequence its ssh.targets note above
+  # describes, and placed in the RPC3 slot because tensor_split indexes
+  # positionally. Then flip the eight config_file lines. Only a head holds the
+  # GGUF, so the restored group must be headed by the node the 122B parts are
+  # already on.
+  #
+  # KNOWN DRIFT IN THE FROZEN FILE, so it does not surprise you mid-rollback:
+  # the jinja comment in aureax-shard-head.yaml names a Qwen3.6 model, while
+  # the file serves Qwen3.5-122B-A10B. That file is kept byte-for-byte as the
+  # rollback target, so the comment is deliberately not corrected — read its
+  # model.filename, not its prose.
+  - name: "qwen35b-a"
+    display_name: "Qwen3.5-35B-A3B Shard Group A"
+    head: "shard-head"
+    workers:
+      - "shard-a1"   # RPC0
+      - "shard-a2"   # RPC1
+      - "shard-a3"   # RPC2
+    rpc_port: 50052
+
+    # The head already streams the whole ~20.5 GiB GGUF from disk and runs
+    # sampling, KV, HTTP and MCP. Pointing it at its own rpc-server would add a
+    # loopback round-trip for tensors already in its address space. Weights
+    # split 3 ways is ~6.9 GiB per worker against ~13 GiB free, so there is no
+    # memory pressure arguing for it either. (These derived numbers are
+    # maintained in k8s/daemonset-shard.yaml's memory sizing — revisit both
+    # together when a group's model or worker count changes.)
+    #
+    # Not just unnecessary — currently rejected by the schema validator, because
+    # nothing starts an rpc-server on the head (client/entrypoint.py spawns one
+    # only for role "shard_worker"), so the head would wait out its peer timeout
+    # on its own port and crash-loop.
+    include_head_as_worker: false
+
+    # llama-server exits immediately if a peer is unreachable, so the head
+    # waits for every worker's RPC port before starting.
+    worker_wait_timeout_seconds: 300
+
+  # Identical to group A in every respect except membership.
+  - name: "qwen35b-b"
+    display_name: "Qwen3.5-35B-A3B Shard Group B"
+    head: "shard-head-b"
+    workers:
+      - "shard-b1"   # RPC0
+      - "shard-b2"   # RPC1
+      - "shard-b3"   # RPC2
+    rpc_port: 50052
+    include_head_as_worker: false
+    worker_wait_timeout_seconds: 300
+
+# ----------------------------------------------------------------------------
+# Kubernetes — k3d on the orchestrator + K3s agents on edge nodes
+# ----------------------------------------------------------------------------
+kubernetes:
+  cluster_name: "aureax"
+  k3d:
+    api_port: 6443
+    servers: 1
+  node_label: "aureax.io/role"
+  edge_label_value: "edge"
+  # The second, orthogonal label key: shard workers get their own switch, so the
+  # stop/start machinery can patch the edge selector without touching them.
+  # Paired with the nodeSelector literal in k8s/daemonset-shard.yaml — rename
+  # one side only and NO worker pod is scheduled, with no error anywhere.
+  shard_label: "aureax.io/shard"
+  shard_label_value: "worker"
+  namespace: "aureax"
+
+# ----------------------------------------------------------------------------
+# Model registry — models available for deployment
+# ----------------------------------------------------------------------------
+model_registry:
+  # RESERVED, on every entry below: `target_roles` is recorded but read by
+  # nothing. Model selection is per-node — each node's own config names the
+  # model it serves — so no role here routes a file anywhere. It stays because
+  # it is the natural place to grow a registry-driven placement.
+  #
+  # INTEGRITY is not reserved. `sha256` / `sha256_parts` / `revision` are read
+  # by download-model.sh: it verifies every declared digest with `shasum -a 256`
+  # before any file is pushed to a node, deletes a part whose bytes do not
+  # match and refuses to push. Declaring none stays legal — the entry is then
+  # size-checked only, and the run says so once per model — but a size is not
+  # an identity: any file of the right length passes, and an unpinned
+  # `revision` resolves `main`, which upstream is free to move between two
+  # provisions of the same fleet. The Qwen3.5-35B-A3B entry below carries the
+  # shape; the digests themselves are the operator's to fill in.
+  models:
+    - name: "Qwen3.5-4B-Instruct"
+      filename: "Qwen3.5-4B-Q4_K_M.gguf"
+      size_gb: 2.5
+      quantization: "Q4_K_M"
+      target_roles: ["edge_executor"]
+      huggingface_repo: "unsloth/Qwen3.5-4B-GGUF"
+      huggingface_file: "Qwen3.5-4B-Q4_K_M.gguf"
+      sha256: null
+
+    - name: "Qwen3.5-9B-Instruct"
+      filename: "Qwen3.5-9B-Q4_K_M.gguf"
+      size_gb: 5.5
+      quantization: "Q4_K_M"
+      target_roles: ["cognitive_planner"]
+      huggingface_repo: "unsloth/Qwen3.5-9B-GGUF"
+      huggingface_file: "Qwen3.5-9B-Q4_K_M.gguf"
+      sha256: null
+
+    # PREVIOUS GROUP MODEL, retained so a rollback is a config edit — it is the
+    # target of configs/aureax-shard-head.yaml, which is kept unmodified for
+    # exactly that purpose. Keep this entry, the GGUF on the head and the
+    # workers' tensor caches for as long as you want that rollback to be a
+    # restart rather than a 71.7 GB re-download.
+    #
+    # Mixture-of-Experts: 122B total parameters but only 10B active per token —
+    # the memory footprint is what a group of eight nodes solves, and the small
+    # active set is what slow ARM cores need. It is superseded not because it is
+    # wrong but because 71.7 GB of weights leaves no room for context: it serves
+    # 4096 tokens.
+    #
+    # SPLIT ACROSS 3 FILES. `filename` names part 1 and the rest are derived
+    # from the `-00001-of-00003` suffix (see gguf_part_names in
+    # orchestrator/config/schema.py); llama.cpp is handed part 1 and opens the
+    # others itself. All three must reach the head.
+    #
+    # Text tower only — the upstream model is multimodal, but the vision
+    # projector (mmproj-*.gguf) is deliberately not deployed so the group
+    # behaves like every other node's model.
+    - name: "Qwen3.5-122B-A10B"
+      filename: "Qwen3.5-122B-A10B-Q4_K_S-00001-of-00003.gguf"
+      # Decimal GB (10^9): 71,705,126,400 bytes across the three parts,
+      # verified against the HF content-length of each.
+      size_gb: 71.7
+      quantization: "Q4_K_S"
+      target_roles: ["edge_executor"]
+      huggingface_repo: "unsloth/Qwen3.5-122B-A10B-GGUF"
+      # NOTE the directory prefix: split quants live in a per-quant subdirectory
+      # in the repo, while the local filename above stays a bare basename. They
+      # are deliberately different — `filename` is what lands in models/, and
+      # `huggingface_file` is where to fetch it from.
+      huggingface_file: "Q4_K_S/Qwen3.5-122B-A10B-Q4_K_S-00001-of-00003.gguf"
+      sha256: null
+
+    # PREVIOUS QUANT of the 122B, retained so a rollback is a config edit.
+    #
+    # Not the one to reach for: on ARM the SMALLER file is the SLOWER one.
+    # Despite the name, "UD-Q3_K_XL" contains no Q3_K at all: its routed experts
+    # are IQ3_XXS (28.98 GB) and IQ4_XS (20.96 GB). IQ3_XXS decodes at roughly
+    # 16% of NEON roofline against Q4_K's ~65%, because its 1024-byte
+    # `iq3xxs_grid` codebook needs a scalar indexed gather per group of weights
+    # and NEON has no gather instruction. Q4_K_S reads MORE expert bytes per
+    # token (2.04 GB vs 1.58 GB) and still costs less time.
+    #
+    # Q4_K_S is also the higher-quality file of the two, so this is not a
+    # speed/quality trade — it is strictly better on both axes for this
+    # hardware.
+    - name: "Qwen3.5-122B-A10B-UD-Q3_K_XL"
+      filename: "Qwen3.5-122B-A10B-UD-Q3_K_XL-00001-of-00003.gguf"
+      size_gb: 57.0
+      quantization: "UD-Q3_K_XL"
+      target_roles: ["edge_executor"]
+      huggingface_repo: "unsloth/Qwen3.5-122B-A10B-GGUF"
+      huggingface_file: "UD-Q3_K_XL/Qwen3.5-122B-A10B-UD-Q3_K_XL-00001-of-00003.gguf"
+      sha256: null
+
+    # CURRENT GROUP MODEL, for BOTH groups. Mixture-of-Experts: 35B total
+    # parameters, 3B active per token. Chosen over the 122B to buy context
+    # rather than parameters — at 22 GB the weight share is ~6.9 GiB per worker
+    # across three workers, which leaves room for a 131072-token KV cache that
+    # 71.7 GB of weights did not.
+    #
+    # Hybrid attention, like the 122B: 40 layers of which only 10 are full
+    # attention (3 Gated-DeltaNet linear layers to 1), so KV is 20 KiB/token
+    # and a 128k context costs only 2.50 GiB for the whole group. The KV
+    # arithmetic lives in configs/aureax-shard-head-35b.yaml.
+    #
+    # SINGLE FILE, unlike the 122B — 22 GB is well under the ~50 GB at which HF
+    # publishes a split GGUF, so `filename` has no -00001-of-000NN suffix and
+    # `huggingface_file` has NO per-quant directory prefix. Both must declare
+    # the same part count (one), which the schema validator enforces.
+    #
+    # Q4_K_M and not any IQ*/UD-IQ* variant, for the ARM NEON reason recorded on
+    # the UD-Q3_K_XL entry above — that argument is about the instruction set,
+    # not about the model, so it carries over unchanged.
+    #
+    # Text tower only — the upstream model is multimodal, but the vision
+    # projector (mmproj-*.gguf) is deliberately not deployed, matching the 122B.
+    - name: "Qwen3.5-35B-A3B"
+      filename: "Qwen3.5-35B-A3B-Q4_K_M.gguf"
+      # Decimal GB (10^9): 22,016,023,168 bytes, from the HF content-length.
+      # download-model.sh judges completeness at 95% of this, so it has to be
+      # right — too high re-downloads a complete file forever, too low accepts
+      # a truncated GGUF.
+      size_gb: 22.02
+      quantization: "Q4_K_M"
+      target_roles: ["edge_executor"]
+      huggingface_repo: "unsloth/Qwen3.5-35B-A3B-GGUF"
+      huggingface_file: "Qwen3.5-35B-A3B-Q4_K_M.gguf"
+      # THE INTEGRITY FIELDS, shown here empty because only the operator can
+      # supply them. `shasum -a 256 models/<file>` prints a digest in exactly
+      # the form these take: 64 LOWERCASE hex characters, compared as a plain
+      # string, so an upper-cased or `sha256:`-prefixed value is refused when
+      # the config is parsed rather than after a 22 GB download.
+      #
+      #   sha256: "3f5a…"        # a SINGLE-FILE GGUF, like this entry
+      #   sha256_parts:          # a SPLIT one instead: ONE PER PART, in part
+      #     - "3f5a…"            # order, paired with the derived part list.
+      #     - "9c11…"            # Never both fields on one entry.
+      #     - "0ab7…"
+      #   revision: "<40-hex commit sha>"   # pins resolve/<ref>; unset is
+      #                                     # `main`, which upstream moves
+      sha256: null
+
+    # DRAFT MODEL for speculative decoding. Not served on its own — it would run
+    # inside a head's llama-server alongside the target, proposing tokens the
+    # target verifies a batch at a time.
+    #
+    # CURRENTLY UNUSED, and must stay that way at 128k context. The vocabulary
+    # still matches (Qwen3.5-0.8B is vocab_size 248320, identical to BOTH
+    # Qwen3.5-122B-A10B and Qwen3.5-35B-A3B, so llama-server would load it
+    # happily) — but this draft is DENSE, so its KV is O(all layers) rather than
+    # the target's 10-of-40, and it inherits the target's n_ctx because
+    # get_llama_server_args emits no draft context size. At 131072 that is
+    # ~6-14 GiB landing entirely on the head. See the `draft:` block in
+    # configs/aureax-shard-head-35b.yaml for the full reasoning.
+    #
+    # Do not substitute a Qwen3 (non-3.5) draft — the tokenizer changed.
+    #
+    # Only a head would need this file; workers hold no weights of their own.
+    - name: "Qwen3.5-0.8B-Draft"
+      filename: "Qwen3.5-0.8B-Q4_K_M.gguf"
+      # Decimal GB (10^9), as download-model.sh's completeness check requires:
+      # 532,517,120 bytes.
+      size_gb: 0.53
+      quantization: "Q4_K_M"
+      target_roles: ["edge_executor"]
+      huggingface_repo: "unsloth/Qwen3.5-0.8B-GGUF"
+      huggingface_file: "Qwen3.5-0.8B-Q4_K_M.gguf"
+      sha256: null
+
+    # The cognitive planner's model (GPU). Also kept on the head as a small
+    # fallback: at 16.8 GB it is the option that fits when the group is short
+    # of members, whereas the group's actual rollback target is the previous
+    # 122B quant above. Distinct roles — do not confuse the two.
+    - name: "Qwen3.6-27B"
+      filename: "Qwen3.6-27B-Q4_K_M.gguf"
+      size_gb: 16.8
+      quantization: "Q4_K_M"
+      target_roles: ["edge_executor", "cognitive_planner"]
+      huggingface_repo: "unsloth/Qwen3.6-27B-GGUF"
+      huggingface_file: "Qwen3.6-27B-Q4_K_M.gguf"
+      sha256: null
+
+# ----------------------------------------------------------------------------
+# Orchestrator services
+# ----------------------------------------------------------------------------
+server:
+
+  telemetry:
+    storage:
+      engine: "sqlite"
+      path: "~/.aureax/telemetry/metrics.db"
+      retention_days: 30
+
+  dashboard:
+    enabled: true
+    port: 7001
+

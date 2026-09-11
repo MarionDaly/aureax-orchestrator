@@ -1,0 +1,279 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aureax-edge
+  namespace: aureax
+  labels:
+    app: aureax-edge
+spec:
+  selector:
+    matchLabels:
+      app: aureax-edge
+  template:
+    metadata:
+      labels:
+        app: aureax-edge
+    spec:
+      # CONTRACT WITH kubernetes.node_label / kubernetes.edge_label_value in
+      # configs/aureax-network.yaml — the same duplication schema.py documents
+      # for the NodePort literals. Deployer.label_nodes applies whatever those
+      # two config values say, and lifecycle patches this selector with them, so
+      # renaming either in config while this literal stays put means the label
+      # goes on the node, the selector matches nothing, and NO pod is scheduled
+      # with no error anywhere. The other copies of these strings that must move
+      # together: scripts/setup-all.sh, scripts/test-all.sh and
+      # orchestrator/dashboard/static/sections/overview.js.
+      nodeSelector:
+        aureax.io/role: "edge"
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoSchedule"
+      # Take the node's own network stack instead of the flannel overlay.
+      #
+      # WHY: on a sharded group's head this pod is the aggregation point for
+      # every hidden-state handoff. Two RPC buffers on different sockets cannot
+      # copy peer-to-peer (ggml_backend_rpc_buffer_cpy_tensor returns false when
+      # the sockets differ), so each handoff is staged through this process —
+      # once per worker in the head's OWN group, so the cost scales with group
+      # size. On the flannel overlay every one of those round trips pays VXLAN
+      # encapsulation, an MTU of 1450 instead of 1500, and a conntrack lookup.
+      # The workers already run this way (daemonset-shard.yaml), so this also
+      # puts both ends of the RPC link on the same footing.
+      #
+      # SECURITY — READ BEFORE DEPLOYING THIS SOMEWHERE UNTRUSTED.
+      # llama-server binds the NODE's address on :8080 rather than a pod IP, and
+      # the MCP server on :9000 is likewise reachable directly. Both are a second
+      # door beside the NodePort services on :30800/:30900, which are the
+      # intended way in.
+      #
+      # Both doors serve HTTPS with a leaf issued by the fleet CA, installed by
+      # the deployer at /etc/aureax/tls (node.pem / node.key / ca.pem). That is
+      # confidentiality and SERVER authentication only — it stops a passive LAN
+      # listener reading prompts, telemetry and bearer tokens, and it proves the
+      # node is the node. It authorizes NOBODY: a client that trusts the CA is
+      # still just a client, so each port carries its own bearer check.
+      #
+      # What guards each door:
+      #   :8080 — bearer auth, IF AND ONLY IF the node's resolved config carries
+      #     model.server.api_key. Every template a node under this DaemonSet is
+      #     currently generated from does (aureax-shard-head-35b.yaml and
+      #     aureax-planner.yaml, plus the standalone aureax-edge.yaml), but the
+      #     frozen 122B rollback target aureax-shard-head.yaml has none and
+      #     genuinely serves open — so this is a per-node property, not a
+      #     fleet-wide one. /health, /v1/health, /models, /v1/models and the
+      #     web-UI assets stay public even with a key set. CORS is left
+      #     permissive (LlamaServerConfig.cors_origins defaults to omitting the
+      #     flag, i.e. llama.cpp's own '*').
+      #   :9000 — bearer auth, IF AND ONLY IF the node's resolved config carries
+      #     mcp.server.api_key — the same per-node, one-template-line shape as
+      #     :8080, and the same caveat: the frozen rollback target has no such
+      #     line and serves MCP open. /health stays exempt with a key set,
+      #     because setup-all.sh, update-all.sh and test-all.sh all wait on it
+      #     unauthenticated and would hang on a 401. Holding only this key still
+      #     reaches key-protected inference: run_inference proxies to :8080 with
+      #     the node's OWN llama key attached. One door, not two factors.
+      #
+      # :50052 (the shard workers, daemonset-shard.yaml) is now the only
+      # plaintext port on a node and the only one with no authentication at all:
+      # llama.cpp's RPC backend speaks a bespoke binary protocol with no TLS and
+      # no auth at any layer, and it deserializes tensor graphs — CVE-2026-34159
+      # was an unauthenticated RCE in exactly that path. A host firewall scoping
+      # it to the group head's address is the only control available for it, and
+      # the shard pod's rpc-firewall init container installs exactly that
+      # (k8s/daemonset-shard.yaml, client/rpc_firewall.py).
+      #
+      # The two doors on THIS DaemonSet get no such treatment: :8080 and :9000
+      # have TLS, a bearer key whenever the node's config sets one (the frozen
+      # rollback pair sets none), and no network control, so they answer anything
+      # on the LAN — which is the same trust model :50052 rests on, a LAN that is
+      # ASSUMED trusted. If these nodes ever sit on a network that is not fully
+      # trusted, that assumption has to be fixed before this line ships there.
+      #
+      # NodePort still works: with hostNetwork the endpoint IP is the node IP,
+      # so externalTrafficPolicy: Local in service-mcp.yaml is trivially
+      # satisfied and MCP session affinity is strengthened, not weakened.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Lets the supervisor see — and kill — an inference process orphaned by a
+      # previous pod. rpc-server serves exactly ONE client, so a llama-server that
+      # outlives its pod keeps this group's RPC slots and the replacement waits
+      # forever on peers it can never reach, reporting only "still loading".
+      # Observed wedging the group for ~40 minutes.
+      #
+      # After its pod dies the orphan is re-parented to host init, in a PID
+      # namespace a fresh container cannot otherwise see — hence hostPID rather
+      # than a check inside the pod. The reaper only ever signals a child this
+      # supervisor RECORDED — pid, start time and boot id under
+      # /opt/aureax/run, matched before the kill (client/process_ownership.py,
+      # called from client/entrypoint.py::_reap_stale_children); an unrecorded
+      # process, whatever its name, is never touched.
+      #
+      # Cost: this container can see every process on the node. These are
+      # single-purpose appliance nodes already running hostNetwork and hostPath.
+      hostPID: true
+      # Nothing in client/ talks to the Kubernetes API server — the orchestrator
+      # drives K8s over SSH and kubectl — so the default
+      # ServiceAccount token the kubelet would otherwise mount at
+      # /var/run/secrets/kubernetes.io/serviceaccount is an unused credential
+      # sitting behind a hostNetwork pod that serves HTTP on the LAN. Bounded
+      # impact (this repo defines no Role or RoleBinding, so that token carries
+      # only system:authenticated), hence defence-in-depth rather than a fix.
+      automountServiceAccountToken: false
+      # Must stay ahead of process.shutdown_timeout_seconds (30s in every config
+      # this DaemonSet serves). That ONE budget covers BOTH serial legs of the
+      # teardown here, split in client/entrypoint.py::_start_mcp_server:
+      # uvicorn's graceful drain gets shutdown_timeout_seconds // 2 and
+      # AureaxClient.stop() gets the remainder, so the worst case is one
+      # shutdown_timeout_seconds — 30s, not 60 — and 45 clears it with headroom.
+      # Do not shrink either number: past the grace period the kubelet SIGKILLs,
+      # and a hostPID llama-server then survives holding :8080 for the next
+      # pod's reaper to find. daemonset-shard.yaml carries the escalation
+      # reasoning in full.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: aureax-client
+          image: aureax-client:dev
+          imagePullPolicy: Never    # Image built locally on node
+          ports:
+            - containerPort: 8080
+              name: llama
+              protocol: TCP
+            - containerPort: 9000
+              name: mcp
+              protocol: TCP
+          env:
+            # The KUBERNETES node name — the host — not the fleet's node.id,
+            # which comes from the mounted config. Its only consumer is the
+            # container banner in docker/scripts/start.sh.
+            - name: AUREAX_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: AUREAX_CONFIG_PATH
+              value: "/etc/aureax/aureax-edge.yaml"
+            - name: LLAMA_SERVER_PATH
+              value: "/usr/local/bin/llama-server"
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+            limits:
+              memory: "12Gi"
+              # No CPU limit, deliberately — same reasoning as
+              # daemonset-shard.yaml, and it matters MORE here.
+              #
+              # A CPU limit installs a CFS quota, and a thread that exhausts it
+              # stalls until the next 100ms period. This pod runs llama-server
+              # (4 inference threads) alongside the Python supervisor, the log-tee
+              # thread, the telemetry thread and the MCP server, all inside one
+              # 4-CPU quota on an 8-core node.
+              #
+              # On a sharded head that is directly on the critical path: two RPC
+              # buffers on different sockets cannot copy peer-to-peer, so every
+              # hidden-state handoff between workers is staged through THIS
+              # process — once per worker in the head's own group, so the hop
+              # count scales with group size. Throttling here is multiplied by
+              # that hop count, and presents as "randomly slow, sometimes fine",
+              # which is very hard to diagnose live.
+              #
+              # The CPU request governs scheduling. Removing the CPU limit
+              # can affect other pods and host workloads. These settings assume
+              # dedicated inference nodes; shared hosts need measured CPU limits.
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aureax
+              readOnly: true
+            - name: data
+              mountPath: /opt/aureax
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # Matches the sibling shard DaemonSet, which runs the IDENTICAL
+            # image under the same block. Neither capability nor escalation is
+            # needed: the reaper signals same-UID root processes and cpu_affinity
+            # is sched_setaffinity on this process's own child.
+            #
+            # Dropped capabilities and disabled escalation reduce privileges;
+            # root with hostPID, hostNetwork and hostPath is not strong isolation.
+            #
+            # runAsNonRoot is NOT set: neither Dockerfile declares a non-root
+            # USER and the hostPath at /opt/aureax is root-owned, so enforcing
+            # it would trade a hardening step for a pod that never starts.
+            # Revisit alongside a non-root image.
+            #
+            # Two consequences of drop ALL worth knowing. It removes
+            # CAP_IPC_LOCK, so a future model.server.use_mlock: true degrades to
+            # llama.cpp's mlock warning rather than locking pages. And it removes
+            # CAP_DAC_OVERRIDE, so the GGUF under /opt/aureax/models — a
+            # directory deployer.py chowns to the SSH user — must stay
+            # other-readable; the 0644 a download leaves is fine, a 0600 model
+            # file would not be.
+          # Model load is the long pole, and for a sharded group it is very
+          # long: the head streams every tensor to its RPC peers over the LAN
+          # before /health ever answers. A startupProbe gives that load a
+          # generous budget while keeping liveness tight once serving begins.
+          # Without it, liveness (3 x 30s) kills the container at ~90s, mid-load,
+          # forever — a CrashLoopBackOff with no obvious cause.
+          #
+          # THE BUDGET MUST COVER THE SUPERVISOR'S WHOLE SEQUENTIAL STARTUP, which
+          # for a sharded head is two waits back to back, not one:
+          #   node.worker_wait_timeout_seconds    (300s) — wait for every RPC peer
+          # + model.server.health_timeout_seconds (2400s) — then load the model
+          #   = 2700s worst case, in configs/aureax-shard-head.yaml.
+          # Budget here: 15 + 200 x 15 = 3015s, i.e. ~5 minutes of headroom over
+          # the worst case. The headroom is deliberate: at failureThreshold 180
+          # the budget was 2715s, a single 15s period clear of the worst case,
+          # so any probe jitter or a timed-out check (timeoutSeconds 5) inside a
+          # genuinely worst-case load would kill the container mid-load.
+          # Raise either of those two config values and this number has to move
+          # with them — that is the exact failure this probe exists to prevent.
+          # Liveness/readiness do not run until the startupProbe first succeeds,
+          # so a small local model is unaffected: it passes on the first check.
+          #
+          # scheme: HTTPS on all three probes below is not optional now that
+          # llama-server serves TLS on :8080. The kubelet's default is HTTP, and
+          # a plaintext GET against a TLS listener fails every time — so the
+          # startupProbe would burn its whole 3015s budget and kill a server
+          # that was answering perfectly, with nothing in the events naming the
+          # scheme as the cause.
+          #
+          # The kubelet does NOT verify the certificate under scheme: HTTPS
+          # (a probe has nowhere to configure a CA), so these probes prove
+          # LIVENESS, not identity — and the leaf's SANs do not have to cover
+          # whatever address the kubelet happens to dial.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTPS
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 200
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTPS
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTPS
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: config
+          hostPath:
+            path: /etc/aureax
+            type: Directory
+        - name: data
+          hostPath:
+            path: /opt/aureax
+            type: DirectoryOrCreate

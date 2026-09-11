@@ -1,0 +1,283 @@
+# ===========================================================================
+# Aureax Edge Client — multi-stage Docker build for edge nodes (ARM64)
+#
+# Build natively on the target node for best performance:
+#   docker build -f docker/Dockerfile.client -t aureax-client:dev .
+# ===========================================================================
+
+# Stage 1: Build llama.cpp from source
+#
+# BASE IMAGES ARE PINNED BY TAG ONLY — this one and the runtime base below —
+# while every other build input is pinned exactly (LLAMA_CPP_VERSION, uv, and
+# the dependency set via `uv export --frozen`). A tag is mutable, and these
+# bases supply glibc, OpenSSL and the CPython patch level behind the .so files
+# copied between stages, so two nodes built a week apart are not the same
+# software. The fix is `debian:bookworm-slim@sha256:<digest>`, using the
+# multi-arch manifest-LIST digest — this image is built natively on each arm64
+# node, so a per-platform digest would fail the build there — and re-pinned
+# deliberately when picking up base security updates, the treatment uv and
+# llama.cpp already get. Not applied yet: obtaining the digest needs a registry
+# fetch. Note this buys provenance, not reproducibility: the apt-get below still
+# resolves whatever gcc/cmake the suite currently ships, so the compiler floats
+# regardless.
+FROM debian:bookworm-slim AS llama-builder
+
+# libssl-dev is load-bearing, not incidental. TLS is mandatory fleet-wide, so
+# llama-server has to be linked against OpenSSL — and llama.cpp's LLAMA_OPENSSL
+# option degrades to a CMake WARNING when find_package(OpenSSL) fails
+# (vendor/cpp-httplib/CMakeLists.txt at b10375), so a builder missing these
+# headers still produces a green build and an image whose llama-server exits
+# with "the server is built without SSL support" the moment a head starts.
+# Bookworm ships OpenSSL 3.0.x, which clears cpp-httplib's >= 3.0.0 gate.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    ca-certificates \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone and build llama.cpp with ARM NEON optimizations.
+#
+# PINNED, deliberately. The RPC wire format is version-locked: every peer in a
+# sharded group must run the byte-identical build, and a mismatch HANGS at the
+# handshake rather than reporting an error. A floating `master` means two nodes
+# built a day apart are different software.
+#
+# b10375 chosen because it is well past both:
+#   - b8492, which fixed CVE-2026-34159 (unauthenticated RCE in the RPC
+#     backend via a GRAPH_COMPUTE buffer=0 deserialization bypass, CVSS 9.8)
+#   - the multi-machine tensor-split regression tracked in issue #21006
+# Verify RPC actually works before trusting a bump: build it, then run
+#   llama-server --rpc <peer>:50052 --list-devices
+# and confirm RPC0 enumerates. Do not pin from release notes alone.
+#
+# The COMMIT is the real pin. A git tag is mutable and this clone
+# authenticates nothing, so a re-pushed upstream tag hands the next node built
+# a different tree — precisely the divergence the RPC wire format cannot
+# tolerate. The check below turns that into a failed build here instead of a
+# hung handshake on the fleet. Both Dockerfiles carry the same pair, for the
+# same lockstep reason.
+ARG LLAMA_CPP_VERSION=b10375
+ARG LLAMA_CPP_COMMIT=ba360efe1f574ebae727aad64112d18ecedca85a
+RUN git clone --depth 1 --branch ${LLAMA_CPP_VERSION} \
+    https://github.com/ggml-org/llama.cpp /build/llama.cpp
+
+WORKDIR /build/llama.cpp
+
+# Check the tag still resolves where it is pinned, and record the exact commit
+# so drift between nodes is detectable before it manifests as a hung handshake.
+RUN git rev-parse HEAD > /build/llama-commit.txt && \
+    if [ "$(cat /build/llama-commit.txt)" != "${LLAMA_CPP_COMMIT}" ]; then \
+        echo "ERROR: ${LLAMA_CPP_VERSION} resolves to $(cat /build/llama-commit.txt)," >&2; \
+        echo "       not the pinned ${LLAMA_CPP_COMMIT} — the upstream tag moved, or" >&2; \
+        echo "       LLAMA_CPP_VERSION was bumped without LLAMA_CPP_COMMIT (update both ARGs together)" >&2; \
+        exit 1; \
+    fi && \
+    printf '{"version":"%s","commit":"%s"}\n' \
+        "${LLAMA_CPP_VERSION}" "$(cat /build/llama-commit.txt)" > /build/llama-build.json
+
+# -DGGML_RPC=ON is what produces the RPC backend AND the ggml-rpc-server tool.
+#
+# -DGGML_NATIVE=OFF with an explicit baseline: native builds bake in -march=native,
+# so an image built on one node and imported onto another with a narrower ISA dies
+# with SIGILL (exit 132, message only in dmesg). The baseline below matches the
+# fleet's Cortex-A76: ARMv8.2 with fp16 and dotprod, but NOT i8mm (ARMv8.6) —
+# compiling with +i8mm would produce exactly that SIGILL.
+#
+# -DLLAMA_OPENSSL=ON is what gives llama-server --ssl-cert-file/--ssl-key-file,
+# which every node now needs. At b10375 that is the option's exact spelling —
+# there is no LLAMA_SERVER_SSL, and a misspelt -D is only an unused cache
+# variable CMake mentions in passing before succeeding. It already defaults to
+# ON, so this line exists to put a future default flip in this diff rather than
+# on the fleet; the ldd assertion below is what actually enforces the outcome.
+RUN cmake -S . -B build -G Ninja \
+    -DGGML_CPU=ON \
+    -DGGML_CPU_AARCH64=ON \
+    -DGGML_RPC=ON \
+    -DGGML_NATIVE=OFF \
+    -DGGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod \
+    -DLLAMA_OPENSSL=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DLLAMA_BUILD_TOOLS=ON \
+    -DLLAMA_BUILD_SERVER=ON \
+    && cmake --build build --config Release -j$(nproc) \
+        --target llama-server ggml-rpc-server llama-bench
+
+# Fail the BUILD if HTTPS did not make it in, because nothing downstream will.
+# LLAMA_OPENSSL defaults ON but degrades to message(WARNING) when OpenSSL is
+# absent or older than 3.0 (vendor/cpp-httplib/CMakeLists.txt at b10375), so
+# the only difference between an image that serves TLS and one that cannot is
+# two DT_NEEDED entries in this binary. Left unchecked, the failure surfaces
+# minutes later and on another machine, as every head crash-looping with
+# "the server is built without SSL support". Assert on the artefact, not on
+# build log text: a WARNING scrolls past and `cmake --build` still exits 0.
+RUN ldd build/bin/llama-server | grep -q 'libssl\.so' \
+ && ldd build/bin/llama-server | grep -q 'libcrypto\.so' \
+ || { echo "ERROR: llama-server was built without OpenSSL — TLS is mandatory" >&2; \
+      ldd build/bin/llama-server >&2; exit 1; }
+
+# Stage the exact file set the runtime image keeps, so nothing is written to a
+# layer only to be deleted from a later one: a COPY of the whole build/bin
+# followed by an `rm -rf` in a later RUN still ships every binary and shared
+# object, because the rm writes a whiteout over bytes the earlier layer holds.
+#
+# The RPC server tool is named rpc-server, llama-rpc-server or ggml-rpc-server
+# depending on the llama.cpp release, and the name is decided ONCE — by the
+# cmake --target list above, where a release that renames it fails on a target
+# that does not exist. That is a better error than anything downstream can
+# produce, so this copies the one name that target built rather than probing
+# for alternatives the build cannot have produced.
+#
+# The existence check is still worth its lines: it catches a target that builds
+# under this name but installs a different OUTPUT_NAME, and a missing binary
+# would otherwise surface only as a worker pod crash-looping at deploy time,
+# minutes away and on another machine.
+#
+# `set -e` with `;` separators rather than one long `&&` chain: in a chain a
+# failed copy only short-circuits to the next `;`, and the RUN's status would
+# be whatever the last command returned — so a llama-server that failed to copy
+# would surface as an exec error on a node instead of failing the build.
+RUN set -e; \
+    mkdir -p /out/bin /out/lib; \
+    cp build/bin/llama-server /out/bin/llama-server; \
+    if [ ! -x build/bin/ggml-rpc-server ]; then \
+        echo "ERROR: cmake built target ggml-rpc-server but no such binary in build/bin:" >&2; \
+        ls -1 build/bin >&2; exit 1; \
+    fi; \
+    cp build/bin/ggml-rpc-server /out/bin/rpc-server; \
+    echo "staged RPC server from 'ggml-rpc-server'"; \
+    # llama-bench is the only way to measure this hardware WITHOUT the RPC
+    # layer in the way. Every number the running server reports is a
+    # whole-pipeline number — one node's kernels, one network hop per worker and
+    # the DVFS behaviour of every node in the group, all folded together — so it
+    # cannot answer "is this node DRAM-bound or dequant-bound?", which is the
+    # question that decides where tuning effort goes. Optional so a stripped build
+    # that omits the target still produces a working image.
+    if [ -x build/bin/llama-bench ]; then \
+        cp build/bin/llama-bench /out/bin/llama-bench; \
+        echo "staged llama-bench"; \
+    else \
+        echo "WARNING: llama-bench not built — single-node benchmarking unavailable" >&2; \
+    fi; \
+    # Unguarded, unlike the same copy in Dockerfile.client.cuda: this build is
+    # dynamic, so an empty glob here means the build did not produce what it
+    # claims and the image would exec into a dynamic-loader error on a node.
+    cp build/bin/lib*.so* /out/lib/
+
+# Stage 2: Runtime
+# Pinned by tag only — see the note on the builder base above for why a
+# @sha256 manifest-list digest belongs here and why it is not applied yet.
+FROM python:3.11-slim-bookworm
+
+# Install minimal runtime deps.
+#
+# libssl3 is declared rather than inherited: the base's CPython drags it in for
+# _ssl today, but llama-server links it directly now, and an image that gets
+# OpenSSL only as somebody else's transitive dependency loses it silently the
+# day that base changes — leaving a binary that cannot exec.
+#
+# NO curl, deliberately — do not re-add it. Nothing in the image invokes one:
+# docker/scripts/start.sh runs `python -m client.entrypoint`, the supervisor and
+# the MCP tools speak HTTPS through httpx, and the kubelet's probes are
+# httpGet/tcpSocket from outside the container. A network-capable download tool
+# is not free in an image that runs as root with hostNetwork and hostPID beside
+# the unauthenticated :50052 surface described in k8s/daemonset-shard.yaml.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    iptables \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# The llama.cpp binaries and the shared objects they link against, both staged
+# in the builder so this copies only what the image keeps. llama.cpp emits the
+# binary and every .so into the same bin/ directory, and the glob there avoids
+# hardcoding version numbers in filenames.
+COPY --from=llama-builder /out/bin/ /usr/local/bin/
+COPY --from=llama-builder /out/lib/ /usr/local/lib/
+# NOT under /etc/aureax — the DaemonSet mounts a hostPath there, which would
+# mask anything the image put in that directory.
+COPY --from=llama-builder /build/llama-build.json /usr/local/share/aureax-llama-build.json
+RUN ldconfig
+
+# Install uv. PINNED for the same reason as LLAMA_CPP_VERSION: nodes are built
+# independently, on different days, so `:latest` means each one resolves a
+# different uv — and this file's whole contract below is a reproducible
+# dependency set.
+COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+# LAYER ORDER IS THE POINT HERE. The lockfile is copied and the dependency set
+# installed BEFORE any source, so editing a line of client/ does not invalidate
+# the dependency layer — which is what makes scripts/update-all.sh a fast
+# Python-only push rather than a full reinstall of the dependency set on every
+# node.
+COPY pyproject.toml uv.lock* ./
+
+# Install Python dependencies FROM THE LOCKFILE.
+#
+# `uv pip install .` resolves pyproject's ranges afresh and ignores uv.lock, so
+# each node image would pick up whatever was newest at ITS build time and a
+# minor-version jump in a dependency would reach the nodes without appearing in
+# any diff.
+#
+# Reproducibility is not cosmetic here: every peer in a sharded group must run
+# the same software, and the nodes are rebuilt independently of each other.
+RUN uv export --frozen --no-dev --no-emit-project -o /tmp/requirements.txt && \
+    uv pip install --system --no-cache -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
+
+# Source last — everything below this line rebuilds on a code change, nothing
+# above it does.
+#
+# README.md and LICENSE are here rather than with pyproject.toml so a docs edit
+# does not invalidate the dependency layer above. The wheel build below needs
+# both: pyproject declares `readme` and `license-files`, so without them the
+# installed package carries no description and no MIT license text, and
+# setuptools' tolerance for a license-files pattern that matches nothing is
+# already deprecated.
+#
+# build_support.py and orchestrator/_resource_manifest.py are build inputs, not
+# runtime code: pyproject registers build_support.BuildPy as setuptools' build_py
+# command, and that class loads the manifest by path (runpy, because the package
+# is not importable mid-build) to decide which operational files the wheel keeps.
+# Missing either one fails the `uv pip install .` below.
+COPY README.md LICENSE build_support.py ./
+COPY client/ ./client/
+COPY orchestrator/config/schema.py ./orchestrator/config/schema.py
+COPY orchestrator/__init__.py ./orchestrator/__init__.py
+COPY orchestrator/_resource_manifest.py ./orchestrator/_resource_manifest.py
+COPY orchestrator/config/__init__.py ./orchestrator/config/__init__.py
+
+# --no-deps: the dependency set is already installed from the lockfile above,
+# and re-resolving here would defeat both the pinning and the layer cache.
+RUN uv pip install --system --no-cache --no-deps .
+
+# Only /tmp/aureax is real at runtime: the DaemonSets hostPath-mount
+# /opt/aureax, so anything the image creates underneath it is masked — the same
+# hazard called out for /etc/aureax above. The supervisor creates the
+# directories it needs under /opt/aureax at startup.
+RUN mkdir -p /tmp/aureax
+
+# Expose ports: llama-server (8080), MCP server (9000), llama.cpp RPC (50052)
+EXPOSE 8080 9000 50052
+
+# Environment
+ENV LLAMA_SERVER_PATH=/usr/local/bin/llama-server
+ENV RPC_SERVER_PATH=/usr/local/bin/rpc-server
+ENV AUREAX_CONFIG_PATH=/etc/aureax/aureax-edge.yaml
+
+# Surfaced as an image label so drift between group members can be detected
+# before it manifests as a hung RPC handshake.
+ARG LLAMA_CPP_VERSION=b10375
+LABEL io.aureax.llama-version="${LLAMA_CPP_VERSION}"
+
+# Entrypoint
+COPY docker/scripts/start.sh /start.sh
+RUN chmod +x /start.sh
+
+CMD ["/start.sh"]

@@ -1,0 +1,243 @@
+# ============================================================================
+# Aureax Cognitive Planner Configuration
+#
+# Same schema as edge configs. The planner is just another edge client — it
+# runs the same image on a node labeled aureax.io/role=edge and gets its
+# config pushed via the same SSH path. It happens to be bigger (larger model,
+# GPU offload) and run in MCP-client mode (it dispatches to edges).
+#
+# It resolves ${node_id}, ${display_name}, ${tags}, ${orchestrator_url},
+# ${api_key} (its own llama-server bearer key, under model.server below) and
+# ${mcp_endpoints} — the last of which now carries each peer's MCP bearer key,
+# making this generated file the one place a fleet-wide set of credentials sits
+# together (0600 in ~/.aureax/configs, 0600 root:root on the node). It takes no
+# ${mcp_api_key} of its own: it serves no MCP endpoint. That is not the same as
+# holding no key — ${api_key} gives this node a llama-server key of its own in
+# ~/.aureax/keys/<node_id>.key, so deleting that line is a real auth change,
+# not a no-op. The full placeholder set is listed in configs/aureax-edge.yaml;
+# the `tls:` block is stamped by the orchestrator, not written here.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. NODE IDENTITY
+# ----------------------------------------------------------------------------
+node:
+  id: "${node_id}"
+  role: "cognitive_planner"
+  display_name: "${display_name}"
+  tags: ${tags}
+
+# ----------------------------------------------------------------------------
+# 2. MODEL CONFIGURATION (llama.cpp — Qwen3.6-27B on 2x NVIDIA GPU)
+# ----------------------------------------------------------------------------
+model:
+  source: "local"
+  # Sized for a planner with ~36 GiB of VRAM in total (two consumer cards is a
+  # typical shape): the 27B needs ~21 GiB — 15.7 GiB of weights plus ~4 GiB of
+  # KV at the 16384 context below — so it fits with room to spare. llama.cpp
+  # splits a model across several cards on its own. On a smaller GPU, pick the
+  # 9B from model_registry instead (~6.3 GiB at this context).
+  name: "Qwen3.6-27B"
+  filename: "Qwen3.6-27B-Q4_K_M.gguf"
+  quantization: "Q4_K_M"
+  local_path: "/opt/aureax/models/"
+
+  server:
+    host: "0.0.0.0"
+    port: 8080
+    context_size: 16384
+    batch_size: 2048
+    parallel_slots: 1
+    gpu_layers: 99
+    threads: -1
+    threads_batch: -1
+    use_mlock: false
+    use_mmap: true
+    flash_attention: true
+    cache_type_k: "f16"
+    cache_type_v: "f16"
+    jinja: true
+
+    # 600s to reach /health from a cold start, against a schema default of
+    # 120s that is scoped to a small local model: this node loads a 16.8 GB
+    # GGUF, and a slower model store turns that default into a crash-loop
+    # rather than a slow start. Overshooting costs nothing — the supervisor
+    # polls every 2s and returns on first success, so this is a deadline, not
+    # a sleep — and 0 + 600 stays well inside the 3015s startupProbe budget in
+    # k8s/daemonset-edge.yaml.
+    health_timeout_seconds: 600
+
+    # Bearer auth for the planner's own llama-server. Same mechanism as the
+    # edge template: ${api_key} resolves at generate time to this node's key
+    # from ~/.aureax/keys/<node_id>.key on the orchestrator, and reaches
+    # llama-server as LLAMA_API_KEY rather than argv. Delete the line to serve
+    # it open.
+    #
+    # /metrics is one of the routes the key protects, and this node polls its
+    # OWN /metrics for throughput — that path already authenticates
+    # (client/telemetry/collector.py::collect_inference_metrics sends the
+    # bearer header, from this same field), so turning auth on here does not
+    # cost the planner its inference metrics.
+    api_key: "${api_key}"
+
+    # Stated rather than defaulted so the toggle is discoverable: false emits
+    # --no-webui. Full note in configs/aureax-edge.yaml.
+    webui: true
+
+# ----------------------------------------------------------------------------
+# 3. AGENT PROMPT & PERSONA
+# ----------------------------------------------------------------------------
+agent:
+  system_prompt: |
+    You are the Aureax cognitive planner. You coordinate a fleet of edge
+    IoT nodes. Each node runs a local LLM and exposes tools via MCP for
+    sensor reading, inference, health monitoring, and anomaly reporting.
+
+    Available tools (prefixed by node_id):
+    - get_health: check node status and llama-server health
+    - get_metrics: read collected telemetry metrics
+    - run_inference: run a prompt on the edge node's local LLM
+    - read_sensor: read IoT sensor data (temperature, humidity, pressure, light, battery)
+    - get_sensor_status: check operational status of all sensors
+    - report_anomaly: log a detected anomaly for review
+
+    When given a task, use the available tools to gather data from nodes
+    and provide clear, concise answers. You may call multiple tools in
+    sequence to build a complete picture before answering.
+
+  agent_name: "planner"
+  agent_description: "Cognitive planner for IoT edge fleet coordination"
+
+# ----------------------------------------------------------------------------
+# 4. MCP CONFIGURATION
+# ----------------------------------------------------------------------------
+mcp:
+  server:
+    enabled: false
+    transport: "streamable-http"
+    port: 9000
+    # RESERVED — documentation only, and empty here anyway: this node serves no
+    # MCP endpoint (enabled: false above), it consumes them. Where the list is
+    # populated it still registers nothing — the edge server declares its tools
+    # in code with @mcp.tool() decorators (client/mcp/server.py).
+    tools: []
+
+  client:
+    enabled: true
+    # Injected from aureax-network.yaml: ${mcp_endpoints} resolves to every
+    # ENABLED target whose own config has mcp.server.enabled — the shard
+    # groups' heads and any standalone edge node — excluding this node itself.
+    #
+    # Derived rather than hand-listed on purpose: a decommissioned or re-roled
+    # node drops out of the list automatically, where a hardcoded address would
+    # leave the planner retrying a dead endpoint forever with nothing reporting
+    # it. Same note lives beside the resolver, in
+    # orchestrator/config/templating.py.
+    remote_servers: ${mcp_endpoints}
+
+# ----------------------------------------------------------------------------
+# 5. TELEMETRY & METRICS
+# ----------------------------------------------------------------------------
+telemetry:
+  # Must stay on, like every other node: /api/nodes is derived entirely from
+  # the telemetry DB, so a node that never pushes is absent from the
+  # dashboard's Telemetry panel.
+  enabled: true
+
+  local:
+    db_path: "/opt/aureax/metrics/planner-telemetry.db"
+    # RESERVED — documentation, not a filter; collect_all() never consults it.
+    # See TelemetryLocal in orchestrator/config/schema.py.
+    collect:
+      inference:
+        - "prompt_tokens"
+        - "completion_tokens"
+        - "tokens_per_second"
+        - "total_inference_time_ms"
+      system:
+        - "cpu_percent"
+        - "memory_percent"
+        - "disk_usage_percent"
+        - "temperature_c"
+    sample_interval_seconds: 60
+    retention_days: 7
+    # RESERVED — unenforced; see TelemetryLocal in
+    # orchestrator/config/schema.py for what actually bounds the buffer.
+    max_db_size_mb: 50
+
+  # This endpoint serves double duty: the metric push (sampling is ON above),
+  # and log shipping, which derives its /api/v1/logs address from this one and
+  # is deliberately NOT gated on `enabled`. Dropping the endpoint would mean
+  # the planner — the only node running an agent loop, and so the one whose
+  # tracebacks matter most — ships nothing at all.
+  remote:
+    endpoint: "${orchestrator_url}/api/v1/telemetry"
+    push_interval_seconds: 60
+
+# ----------------------------------------------------------------------------
+# 6. PROCESS MANAGEMENT
+# ----------------------------------------------------------------------------
+process:
+  # RESERVED except shutdown_timeout_seconds — managed_services,
+  # shutdown_order and the nested health_check are documentation of intent;
+  # see ProcessConfig and the note above HealthCheck in
+  # orchestrator/config/schema.py. The supervisor picks its one child from
+  # node.role (client/entrypoint.py), and liveness/readiness come from the
+  # DaemonSet's probes (k8s/daemonset-edge.yaml).
+  managed_services:
+    - name: "llama-server"
+      type: "llama_cpp"
+      restart_policy: "always"
+      max_restarts: 10
+      restart_delay_seconds: 5
+      health_check:
+        endpoint: "https://127.0.0.1:8080/health"
+        interval_seconds: 30
+        timeout_seconds: 5
+        unhealthy_threshold: 3
+
+  shutdown_order: ["llama-server"]
+  shutdown_timeout_seconds: 30
+
+# ----------------------------------------------------------------------------
+# 7. STORAGE & PATHS
+# ----------------------------------------------------------------------------
+# RESERVED, the whole block — nothing reads any of these paths; every use site
+# hardcodes its own (StorageConfig in orchestrator/config/schema.py). The
+# tmp_path deviation below (/opt/aureax/tmp rather than /tmp/aureax) therefore
+# changes nothing today. Kept as reserved for a future platform-aware storage
+# layout.
+storage:
+  base_path: "/opt/aureax"
+  models_path: "/opt/aureax/models"
+  logs_path: "/opt/aureax/logs"
+  queue_path: "/opt/aureax/mcp/queue"
+  metrics_path: "/opt/aureax/metrics"
+  tmp_path: "/opt/aureax/tmp"
+
+# ----------------------------------------------------------------------------
+# 8. LOGGING
+# ----------------------------------------------------------------------------
+logging:
+  # RESERVED except llama_log_path — the read/unread split, and the five
+  # ACTIVE fields no template sets (so every node runs them on their schema
+  # defaults, which is why warn/error lines reach the orchestrator without
+  # anything here saying so), are documented on LoggingConfig in
+  # orchestrator/config/schema.py. llama_log_path IS read: it names the
+  # llama-server log this node's child writes.
+  level: "info"
+  format: "json"
+  output: "both"
+  file_path: "/opt/aureax/logs/planner.log"
+  max_file_size_mb: 50
+  max_files: 3
+  llama_log_path: "/opt/aureax/logs/planner-llama-server.log"
+
+# ----------------------------------------------------------------------------
+# 9. DEPLOYMENT METADATA
+# ----------------------------------------------------------------------------
+deployment:
+  deployed_at: null
+  deployed_by: null
+  config_version: null
+  config_hash: null

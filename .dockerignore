@@ -1,0 +1,39 @@
+# Keep the Docker build context small. Anything matched here is NOT sent to
+# the Docker daemon. The Dockerfiles (docker/Dockerfile.client*) don't COPY
+# any of these — they'd just bloat the build context.
+.venv
+.git
+.gitignore
+build
+__pycache__
+*.egg-info
+*.pyc
+models/
+*.gguf
+.aureax/
+.claude/
+.pytest_cache
+tests/
+.github/
+# Orchestrator-side YAML. No Dockerfile COPYs it — the resolved per-node config
+# reaches a node over SSH as /etc/aureax/aureax-edge.yaml, never through the
+# image. Excluded explicitly because aureax-network.yaml carries the fleet's SSH
+# password, and a build context is unpacked on whichever node is building.
+configs/
+
+.env
+.env.*
+# Fleet CA and leaf material. A node's copies arrive over SSH into
+# /etc/aureax/tls, never through an image, and a build context is unpacked on
+# whichever node is building.
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+*.db*
+*.sqlite*
+dist/
+htmlcov/
+.coverage*
+CLAUDE*.md
+TODO.md

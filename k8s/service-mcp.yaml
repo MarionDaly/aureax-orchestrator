@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: aureax-mcp
+  namespace: aureax
+  labels:
+    app: aureax-edge
+spec:
+  type: NodePort
+  # externalTrafficPolicy: Local ensures that NodePort traffic to a node's IP
+  # only routes to the pod on THAT node, not load-balanced across all pods.
+  # This is required because the MCP protocol uses session IDs — all requests
+  # in a session must reach the same pod. Without this, the client's POST
+  # (initialize) and background GET stream can land on different pods,
+  # causing "Session terminated" errors.
+  externalTrafficPolicy: Local
+  selector:
+    app: aureax-edge
+  ports:
+    - name: mcp
+      protocol: TCP
+      port: 9000
+      targetPort: 9000
+      nodePort: 30900

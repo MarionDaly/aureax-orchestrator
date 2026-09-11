@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aureax
+  labels:
+    app.kubernetes.io/part-of: aureax
+    # DECLARATION, NOT A LOOSENING. Both workloads in this namespace set
+    # hostNetwork and hostPID — k8s/daemonset-edge.yaml and
+    # k8s/daemonset-shard.yaml, each with its own rationale beside the setting —
+    # which the `baseline` Pod Security profile forbids, so `privileged` is the
+    # only level they admit under. Stating it records that requirement here.
+    #
+    # A no-op on this project's own cluster: k3d is created with no admission
+    # configuration (orchestrator/cluster/k3d.py, scripts/setup-k3d.sh), so the
+    # namespace inherits `privileged` anyway. It exists for the cluster that
+    # does not — a K3s upgrade or a cluster-wide baseline/restricted default.
+    # PSA gates Pods, not controllers, so without this label the DaemonSets
+    # would still be created and then emit FailedCreate events forever with no
+    # pod: the label is what keeps that from being the first symptom.
+    #
+    # enforce only. warn/audit are deliberately left unset — these pods
+    # legitimately violate baseline, so setting them would print warnings on
+    # every kubectl apply and bury the audit trail in expected noise.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest

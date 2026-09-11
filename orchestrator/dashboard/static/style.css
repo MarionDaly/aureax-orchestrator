@@ -1,0 +1,1092 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0d1117;
+    color: #c9d1d9;
+    padding: 24px;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 32px;
+    border-bottom: 1px solid #21262d;
+    padding-bottom: 16px;
+}
+
+header h1 {
+    color: #58a6ff;
+    font-size: 24px;
+    font-weight: 600;
+}
+
+.subtitle {
+    color: #8b949e;
+    font-size: 14px;
+}
+
+.update-time {
+    margin-left: auto;
+    color: #8b949e;
+    font-size: 12px;
+}
+
+h2 {
+    font-size: 16px;
+    font-weight: 600;
+    color: #c9d1d9;
+    margin-bottom: 12px;
+}
+
+section {
+    margin-bottom: 32px;
+}
+
+.card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 16px;
+}
+
+.card {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 8px;
+    padding: 16px;
+}
+
+.card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.card-header h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: #c9d1d9;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.status-dot.online { background: #3fb950; }
+.status-dot.offline { background: #f85149; }
+.status-dot.unknown { background: #8b949e; }
+
+.metrics-list {
+    list-style: none;
+}
+
+.metrics-list li {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    font-size: 13px;
+    border-bottom: 1px solid #21262d;
+}
+
+.metrics-list li:last-child {
+    border-bottom: none;
+}
+
+.metric-name {
+    color: #8b949e;
+}
+
+.metric-value {
+    color: #c9d1d9;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 12px;
+}
+
+.cluster-node {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0;
+    font-size: 13px;
+    border-bottom: 1px solid #21262d;
+}
+
+.cluster-node:last-child {
+    border-bottom: none;
+}
+
+.badge {
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 500;
+}
+
+.badge.ready {
+    background: #1a3a2a;
+    color: #3fb950;
+}
+
+.badge.not-ready {
+    background: #3a1a1a;
+    color: #f85149;
+}
+
+.badge.edge {
+    background: #1a2a3a;
+    color: #58a6ff;
+}
+
+/* --- Pod status --- */
+
+.pod-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #8b949e;
+    margin-bottom: 10px;
+}
+
+.containers-list {
+    border-top: 1px solid #21262d;
+    padding-top: 8px;
+}
+
+.container-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 0;
+    font-size: 13px;
+}
+
+.container-name {
+    color: #c9d1d9;
+    flex: 1;
+}
+
+/* Inline error block, shared by three sections: a container's crash reason
+   (overview), a YAML validation error (configs) and a chat error bubble
+   (chat) — so restyling "the pod crash box" repaints all three. */
+.pod-error {
+    background: #2d1216;
+    border: 1px solid #f8514933;
+    border-radius: 4px;
+    color: #f85149;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 11px;
+    padding: 6px 8px;
+    margin: 4px 0 8px 16px;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+.status-dot.degraded { background: #d29922; }
+
+.badge.crash {
+    background: #3a1a1a;
+    color: #f85149;
+}
+
+.badge.warn {
+    background: #3a2a1a;
+    color: #d29922;
+}
+
+/* --- Empty state --- */
+
+.empty-state {
+    color: #8b949e;
+    font-size: 14px;
+    padding: 24px;
+    text-align: center;
+}
+
+/* --- Tabs --- */
+
+.tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 24px;
+    border-bottom: 1px solid #21262d;
+}
+
+.tab {
+    padding: 8px 16px;
+    color: #8b949e;
+    text-decoration: none;
+    font-size: 14px;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+}
+
+.tab:hover {
+    color: #c9d1d9;
+}
+
+.tab.active {
+    color: #58a6ff;
+    border-bottom-color: #58a6ff;
+}
+
+/* --- Buttons --- */
+
+.btn {
+    background: #21262d;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    font-family: inherit;
+    text-decoration: none;
+    display: inline-block;
+}
+
+.btn:hover:not(:disabled):not([aria-disabled="true"]) {
+    background: #30363d;
+    border-color: #8b949e;
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* aria-disabled placeholders are spans — lifecycle.js renders one wherever a
+   shard worker has no endpoint to link to — and :disabled matches form elements
+   only. Without this they keep the pointer cursor and full opacity, and read as
+   live controls; hover is excluded for them on .btn and .btn-ghost too. */
+.btn[aria-disabled="true"] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.btn-primary {
+    background: #238636;
+    border-color: #2ea043;
+    color: #ffffff;
+}
+
+.btn-primary:hover:not(:disabled) {
+    background: #2ea043;
+}
+
+.btn-danger {
+    background: #da3633;
+    border-color: #f85149;
+    color: #ffffff;
+}
+
+.btn-danger:hover:not(:disabled) {
+    background: #f85149;
+}
+
+.btn-ghost {
+    background: transparent;
+    color: #f85149;
+    border-color: #f8514955;
+}
+
+.btn-ghost:hover:not(:disabled):not([aria-disabled="true"]) {
+    background: #2d1216;
+    border-color: #f85149;
+}
+
+/* --- Shared controls ---
+   Skins used by more than one section. They keep their original class names
+   because renaming means touching every call site at once. */
+
+/* <select> skin. Call sites: chat.js (target and session pickers), lifecycle.js
+   (the log Min-level and Source filters) — one rule so the four pickers cannot
+   drift apart. */
+.select-control {
+    background: #0b0f14;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-family: inherit;
+    font-size: 13px;
+}
+
+/* Flex spacer in a header row. Call sites: configs.js, chat.js, access.js —
+   one rule so the three headers cannot drift. */
+.spacer {
+    flex: 1;
+}
+
+/* Labelled row inside a card. Call sites: access.js (endpoints and keys),
+   node.js (identity and capacity) — one rule so the label column of the two
+   cards lines up at the same width. */
+.endpoint-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 7px 0;
+    border-top: 1px solid #21262d;
+}
+
+.endpoint-label {
+    color: #8b949e;
+    font-size: 12px;
+    min-width: 160px;
+}
+
+/* --- Lifecycle panel --- */
+
+.lifecycle-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.lifecycle-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.control-group {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.control-label {
+    color: #8b949e;
+    font-size: 13px;
+    min-width: 100px;
+}
+
+.node-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    border-top: 1px solid #21262d;
+    width: 100%;
+}
+
+.control-hint {
+    color: #8b949e;
+    font-size: 12px;
+}
+
+/* Shown only when /api/lifecycle/state stops answering, alongside greying every
+   node dot. Carries the `hidden` attribute when empty so it contributes no flex
+   gap to .lifecycle-panel. */
+.lifecycle-alert {
+    color: #d29922;
+    font-size: 12px;
+}
+
+/* --- Log pane --- */
+
+.log-pane {
+    background: #0b0f14;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 12px;
+    padding: 12px;
+    height: 360px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.log-line {
+    padding: 1px 0;
+    color: #c9d1d9;
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+}
+
+/* The `!important` is what defeats `.log-line { display: flex }` above, and any
+   duplicate of it further down: without it a row the filter marks hidden goes on
+   rendering and every log filter silently stops working. Sitting after .log-line
+   is belt-and-braces — source order would only matter if the !important were
+   dropped. */
+.log-hidden { display: none !important; }
+
+.log-debug   { color: #8b949e; }
+.log-info    { color: #c9d1d9; }
+.log-warn    { color: #d29922; }
+.log-error   { color: #f85149; }
+.log-success { color: #3fb950; }
+.log-hint    { color: #58a6ff; }
+
+
+.log-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 24px;
+}
+
+.log-header h2 {
+    margin: 0;
+}
+
+.log-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    color: #8b949e;
+}
+
+.log-controls label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.log-badge {
+    display: inline-block;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: #21262d;
+    color: #8b949e;
+    flex: 0 0 auto;
+    font-family: "SF Mono", Monaco, monospace;
+}
+
+.log-src-lifecycle { background: #1a2a3a; color: #58a6ff; }
+.log-src-chat      { background: #2a1a3a; color: #bc8cff; }
+.log-src-telemetry { background: #1a3a2a; color: #3fb950; }
+.log-src-pods      { background: #1f2f3f; color: #79c0ff; }
+.log-src-nodes     { background: #2f1f3f; color: #d2a8ff; }
+.log-src-drift     { background: #3a1a1a; color: #f85149; }
+.log-src-config    { background: #3a2a1a; color: #d29922; }
+/* access_api emits key-rotation and apply lines with source="access", and they
+   need a colour of their own: the .log-badge default is byte-identical to
+   .log-src-stream, so those lines would read as stream chatter. */
+.log-src-access    { background: #1a3a3a; color: #56d4dd; }
+.log-src-stream    { background: #21262d; color: #8b949e; }
+
+/* --- Configs section --- */
+
+.configs-layout {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    gap: 0;
+    padding: 0;
+    min-height: 500px;
+}
+
+.config-sidebar {
+    border-right: 1px solid #21262d;
+    padding: 16px;
+    overflow-y: auto;
+    max-height: 70vh;
+}
+
+.config-group {
+    margin-bottom: 16px;
+}
+
+.config-group-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #8b949e;
+    margin-bottom: 6px;
+}
+
+.config-list {
+    list-style: none;
+}
+
+.config-item {
+    padding: 6px 8px;
+    font-size: 13px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.config-item:hover {
+    background: #21262d;
+}
+
+.config-item.active {
+    background: #1a2a3a;
+    color: #58a6ff;
+}
+
+.config-name {
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 12px;
+    flex: 1;
+}
+
+.config-editor {
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    min-height: 500px;
+}
+
+.editor-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.editor-title {
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 13px;
+    color: #c9d1d9;
+}
+
+.editor-meta {
+    font-size: 11px;
+    color: #8b949e;
+}
+
+.editor-textarea {
+    flex: 1;
+    min-height: 420px;
+    background: #0b0f14;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 12px;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    resize: vertical;
+    tab-size: 2;
+}
+
+.editor-textarea:focus {
+    outline: none;
+    border-color: #58a6ff;
+}
+
+.editor-textarea[readonly] {
+    background: #161b22;
+    color: #8b949e;
+}
+
+.editor-status {
+    font-size: 12px;
+    color: #8b949e;
+    margin-top: 8px;
+}
+
+/* Sits between the editor header and the textarea when GET /api/config/{name}
+   reports redacted values, so the marker in the buffer is explained where the
+   operator is about to edit it. Muted, not alarming: redaction is the normal
+   state of these two kinds. */
+.editor-note {
+    font-size: 12px;
+    color: #d29922;
+    background: #3a2a1a;
+    border: 1px solid #d2992255;
+    border-radius: 4px;
+    padding: 6px 10px;
+    margin-bottom: 8px;
+}
+
+/* --- Banner --- */
+
+.banner {
+    background: #3a2a1a;
+    border: 1px solid #d2992255;
+    color: #d29922;
+    padding: 10px 14px;
+    border-radius: 6px;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+}
+
+.banner code {
+    font-family: "SF Mono", Monaco, monospace;
+    background: #0b0f14;
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: #c9d1d9;
+}
+
+.banner .btn-ghost {
+    color: #8b949e;
+    border-color: transparent;
+}
+
+/* --- Access section --- */
+
+.access-bar {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 10px 0;
+    margin-bottom: 16px;
+    background: #0d1117;
+    border-bottom: 1px solid #21262d;
+}
+
+.access-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.access-card {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+/* Deep-link highlight (#access/<node_id>), removed after a couple of seconds */
+.access-card-focus {
+    border-color: #58a6ff;
+    box-shadow: 0 0 0 2px #58a6ff44;
+}
+
+.access-card-worker {
+    border-style: dashed;
+}
+
+.access-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding-bottom: 8px;
+}
+
+.access-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: #c9d1d9;
+}
+
+.access-sub {
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 12px;
+    color: #8b949e;
+}
+
+.access-muted {
+    color: #8b949e;
+    font-size: 12px;
+}
+
+.access-worker-note {
+    padding-top: 6px;
+}
+
+.access-link {
+    color: #58a6ff;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 12px;
+    word-break: break-all;
+}
+
+.copy-field {
+    flex: 1;
+    min-width: 220px;
+    background: #0b0f14;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 5px 8px;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 12px;
+}
+
+.copy-field:focus {
+    outline: none;
+    border-color: #58a6ff;
+}
+
+.snippet-block {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px 0;
+    border-top: 1px solid #21262d;
+}
+
+.snippet {
+    align-self: stretch;
+    background: #0b0f14;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 12px;
+    color: #c9d1d9;
+    overflow-x: auto;
+    white-space: pre;
+}
+
+.access-auth {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 0;
+    border-top: 1px solid #21262d;
+}
+
+.auth-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: #c9d1d9;
+    cursor: pointer;
+}
+
+.key-field {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.access-actions {
+    padding: 10px 0 2px;
+    border-top: 1px solid #21262d;
+}
+
+.access-status {
+    font-size: 12px;
+    color: #8b949e;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #21262d;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.access-outcome {
+    font-family: "SF Mono", Monaco, monospace;
+    color: #c9d1d9;
+}
+
+.access-note {
+    color: #d29922;
+    font-size: 12px;
+}
+
+.btn-link {
+    background: transparent;
+    border-color: transparent;
+    color: #58a6ff;
+    padding: 2px 4px;
+}
+
+.btn-link:hover:not(:disabled) {
+    background: transparent;
+    border-color: transparent;
+    text-decoration: underline;
+}
+
+.copy-feedback {
+    color: #3fb950;
+    border-color: #3fb95066;
+}
+
+/* Access badges. `in_sync` is intentionally NOT the green of `applied`: it
+   means config matches what was pushed, with the live probe not yet in. */
+.badge.badge-applied {
+    background: #1a3a2a;
+    color: #3fb950;
+}
+
+.badge.badge-in-sync {
+    background: #1a2a3a;
+    color: #58a6ff;
+}
+
+.badge.badge-pending {
+    background: #3a2a1a;
+    color: #d29922;
+}
+
+.badge.badge-drift {
+    background: #3a1a1a;
+    color: #f85149;
+}
+
+.badge.badge-unknown {
+    background: #21262d;
+    color: #8b949e;
+}
+
+.badge.badge-unsupported {
+    background: transparent;
+    color: #6e7681;
+    border: 1px solid #30363d;
+}
+
+/* --- Chat section --- */
+
+.chat-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 70vh;
+}
+
+.chat-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #21262d;
+}
+
+/* Live run state in the chat header ("Thinking…", "Reconnecting…"), not a
+   last-refreshed stamp: it carries no margin-left:auto, because the .spacer
+   beside it is what pushes the buttons to the right. */
+.chat-status {
+    color: #8b949e;
+    font-size: 12px;
+}
+
+.chat-messages {
+    flex: 1;
+    min-height: 360px;
+    max-height: 60vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 4px 0;
+}
+
+.chat-msg {
+    display: flex;
+    flex-direction: column;
+    max-width: 85%;
+    gap: 6px;
+}
+
+.chat-user {
+    align-self: flex-end;
+    align-items: flex-end;
+}
+
+.chat-assistant {
+    align-self: flex-start;
+    align-items: flex-start;
+}
+
+.chat-bubble {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 10px;
+    padding: 8px 12px;
+    font-size: 13px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.chat-user .chat-bubble {
+    background: #1a2a3a;
+    border-color: #58a6ff44;
+    color: #c9d1d9;
+}
+
+.chat-tool {
+    background: #0b0f14;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    font-size: 12px;
+    max-width: 600px;
+    overflow: hidden;
+}
+
+.chat-tool summary {
+    padding: 6px 10px;
+    cursor: pointer;
+    user-select: none;
+    color: #8b949e;
+    font-family: "SF Mono", Monaco, monospace;
+}
+
+.chat-tool[open] summary {
+    border-bottom: 1px solid #21262d;
+}
+
+.chat-tool-label {
+    color: #58a6ff;
+}
+
+.chat-tool-body {
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.chat-tool-section {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.chat-tool-section > span {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #8b949e;
+}
+
+.chat-tool-section pre {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-family: "SF Mono", Monaco, monospace;
+    font-size: 11px;
+    color: #c9d1d9;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.chat-tool-pending {
+    color: #d29922;
+    font-style: italic;
+}
+
+.chat-input {
+    display: flex;
+    gap: 8px;
+    padding-top: 12px;
+    border-top: 1px solid #21262d;
+}
+
+.chat-input textarea {
+    flex: 1;
+    background: #0b0f14;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 13px;
+    resize: vertical;
+    min-height: 44px;
+}
+
+.chat-input textarea:focus {
+    outline: none;
+    border-color: #58a6ff;
+}
+
+/* --- Node section --- */
+
+/* The Overview telemetry card, which is the link into this section. Painted as
+   a card rather than left to the default link skin: the underline and link
+   colour would otherwise land on every metric name inside it. */
+.node-card {
+    display: block;
+    color: inherit;
+    text-decoration: none;
+}
+
+.node-card:hover {
+    border-color: #58a6ff;
+}
+
+/* The count of metrics the Overview card does not list. Muted: it is a pointer
+   at this section, not a reading. */
+.more-metrics {
+    color: #8b949e;
+    font-size: 12px;
+}
+
+.node-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+}
+
+/* Its margin would otherwise be added below the whole flex row. */
+.node-head h2 {
+    margin: 0;
+}
+
+/* Deliberately NOT a `.metrics-list li`: that rule is a flex row, which would
+   put the sparkline beside its label instead of under it. */
+.metric-row {
+    padding: 6px 0;
+    border-bottom: 1px solid #21262d;
+}
+
+.metric-row:last-child {
+    border-bottom: none;
+}
+
+.metric-row-head {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+}
+
+.sparkline {
+    width: 100%;
+    height: 24px;
+    display: block;
+}
+
+/* Paint lives here rather than on the element: node.js re-emits every polyline
+   on each 10s poll, and stroke/fill attributes there would put the dashboard's
+   accent colour somewhere no stylesheet search finds it. */
+.sparkline polyline {
+    fill: none;
+    stroke: #58a6ff;
+    stroke-width: 1.5;
+    /* preserveAspectRatio="none" stretches the 100-unit viewBox to the row's
+       width, which would scale the stroke with it and give every chart a
+       different line weight. */
+    vector-effect: non-scaling-stroke;
+}
+
+/* The age beside a shipped log line. Muted because it is context for the line
+   rather than part of it, and unshrinkable because .log-line is a flex row: a
+   long crash message would otherwise squeeze "12m ago" onto two lines. */
+.log-time {
+    color: #8b949e;
+    flex: 0 0 auto;
+}

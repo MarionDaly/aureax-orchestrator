@@ -1,0 +1,238 @@
+# ===========================================================================
+# Aureax Client — multi-stage Docker build for x86_64 + NVIDIA GPU nodes
+#
+# Build natively on the target node for best performance:
+#   docker build -f docker/Dockerfile.client.cuda -t aureax-client:dev .
+#
+# Pairs with docker/Dockerfile.client (ARM64 / CPU). Same final image tag
+# (aureax-client:dev) so the DaemonSet doesn't need to branch.
+# ===========================================================================
+
+# Stage 1: Build llama.cpp from source with CUDA
+# Pinned by tag only, like both bases in docker/Dockerfile.client — the full
+# reasoning is there. Same for the runtime base below. Applying the @sha256
+# manifest-list digest needs a registry fetch, so it is still outstanding.
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS llama-builder
+
+# libssl-dev is load-bearing here for the same reason as in
+# docker/Dockerfile.client: LLAMA_OPENSSL degrades to a CMake WARNING when
+# find_package(OpenSSL) fails, so a builder without the headers still exits 0
+# and ships a llama-server that dies with "the server is built without SSL
+# support" on the first head that starts. Jammy ships OpenSSL 3.0.2, over
+# cpp-httplib's >= 3.0.0 gate.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    ca-certificates \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# MUST match Dockerfile.client exactly. The RPC wire format is version-locked,
+# so a group whose members were built from different llama.cpp versions hangs
+# at the handshake rather than reporting an error. Mixed BACKENDS (CUDA here,
+# CPU there) are fine; mixed VERSIONS are not.
+ARG LLAMA_CPP_VERSION=b10375
+ARG LLAMA_CPP_COMMIT=ba360efe1f574ebae727aad64112d18ecedca85a
+RUN git clone --depth 1 --branch ${LLAMA_CPP_VERSION} \
+    https://github.com/ggml-org/llama.cpp /build/llama.cpp
+
+WORKDIR /build/llama.cpp
+
+# A moved tag fails the build here — Dockerfile.client carries the reasoning for
+# why the commit, not the mutable tag, is what actually pins this build.
+RUN git rev-parse HEAD > /build/llama-commit.txt && \
+    if [ "$(cat /build/llama-commit.txt)" != "${LLAMA_CPP_COMMIT}" ]; then \
+        echo "ERROR: ${LLAMA_CPP_VERSION} resolves to $(cat /build/llama-commit.txt)," >&2; \
+        echo "       not the pinned ${LLAMA_CPP_COMMIT} — the upstream tag moved, or" >&2; \
+        echo "       LLAMA_CPP_VERSION was bumped without LLAMA_CPP_COMMIT (update both ARGs together)" >&2; \
+        exit 1; \
+    fi && \
+    printf '{"version":"%s","commit":"%s"}\n' \
+        "${LLAMA_CPP_VERSION}" "$(cat /build/llama-commit.txt)" > /build/llama-build.json
+
+# -DLLAMA_OPENSSL=ON must stay in lockstep with Dockerfile.client: TLS is
+# mandatory fleet-wide, and at b10375 this is the option's exact spelling (there
+# is no LLAMA_SERVER_SSL, and a misspelt -D is merely an unused cache variable
+# CMake notes in passing before succeeding). It already defaults to ON; the line
+# is here so a future default flip shows up in a diff, and the ldd assertion
+# below is what actually enforces the outcome.
+#
+# No -DGGML_NATIVE=OFF here, unlike Dockerfile.client. That flag exists there to
+# stop an image built on one node and moved onto another with a narrower ISA
+# dying with SIGILL; this image is built on the GPU node that runs it and never
+# leaves that machine (build-on-node.sh imports it into the same node's
+# containerd), so a -march=native build is simply the faster one. A SECOND GPU
+# node changes that: it would need -DGGML_NATIVE=OFF plus an explicit x86-64
+# baseline that both nodes satisfy.
+RUN cmake -S . -B build -G Ninja \
+    -DGGML_CUDA=ON \
+    -DGGML_RPC=ON \
+    -DLLAMA_OPENSSL=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DLLAMA_BUILD_TOOLS=ON \
+    -DLLAMA_BUILD_SERVER=ON \
+    -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" \
+    && cmake --build build --config Release -j$(nproc) \
+        --target llama-server ggml-rpc-server llama-bench
+
+# Fail the BUILD if HTTPS did not make it in — see Dockerfile.client for the
+# full reasoning. --allow-shlib-undefined above does not suppress DT_NEEDED
+# entries, so ldd still reports what this binary actually links, and a build
+# that silently lost OpenSSL is caught here rather than as a crash-looping head.
+RUN ldd build/bin/llama-server | grep -q 'libssl\.so' \
+ && ldd build/bin/llama-server | grep -q 'libcrypto\.so' \
+ || { echo "ERROR: llama-server was built without OpenSSL — TLS is mandatory" >&2; \
+      ldd build/bin/llama-server >&2; exit 1; }
+
+# Stage the exact file set the runtime image keeps — see Dockerfile.client for
+# why this happens here and not in the runtime stage, and for why the RPC
+# server's name is decided by the cmake --target list above rather than probed.
+# `set -e` with `;` separators rather than one long `&&` chain: in a chain a
+# failed copy only short-circuits to the next `;`, and the RUN's status would
+# be whatever the last `if` block returned — so a llama-server that failed to
+# copy would surface as an exec error on a node instead of failing the build.
+RUN set -e; \
+    mkdir -p /out/bin /out/lib; \
+    cp build/bin/llama-server /out/bin/llama-server; \
+    if [ ! -x build/bin/ggml-rpc-server ]; then \
+        echo "ERROR: cmake built target ggml-rpc-server but no such binary in build/bin:" >&2; \
+        ls -1 build/bin >&2; exit 1; \
+    fi; \
+    cp build/bin/ggml-rpc-server /out/bin/rpc-server; \
+    echo "staged RPC server from 'ggml-rpc-server'"; \
+    # Kept in lockstep with Dockerfile.client so both images can be benchmarked
+    # the same way. See the comment there for why it earns its place.
+    if [ -x build/bin/llama-bench ]; then \
+        cp build/bin/llama-bench /out/bin/llama-bench; \
+        echo "staged llama-bench"; \
+    else \
+        echo "WARNING: llama-bench not built — single-node benchmarking unavailable" >&2; \
+    fi; \
+    # Tolerated, but only behind a check that says so out loud. A CUDA build
+    # that links everything statically emits no lib*.so at all, which is a
+    # legitimate outcome here; a silent `|| true` would also swallow a build
+    # that emitted them and failed to copy, leaving a runtime image whose
+    # llama-server dies at exec time with a dynamic-loader error on another
+    # machine.
+    if ls build/bin/lib*.so* >/dev/null 2>&1; then \
+        cp build/bin/lib*.so* /out/lib/; \
+    else \
+        echo "no shared libraries in build/bin (static llama.cpp build)"; \
+    fi
+
+# Stage 2: Runtime
+# Pinned by tag only — see the builder base above.
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# NO python3-pip AND NO python3.11-venv, deliberately — do not re-add them.
+# Nothing in this image invokes either: dependencies are installed by
+# `uv pip install --system` below, and docker/scripts/start.sh runs
+# `python -m client.entrypoint` against the symlinks created here. python3-pip
+# is also not free on jammy: it depends on python3 (= 3.10), so it drags a
+# SECOND CPython interpreter plus pip and setuptools into a runtime image that
+# serves HTTP on the LAN.
+#
+# The symlinks below ARE load-bearing (start.sh calls `python`), and uv finds
+# its interpreter from PATH, not via pip. Note Dockerfile.client's
+# python:3.11-slim-bookworm base ships pip regardless — that asymmetry is
+# expected, not a regression here.
+#
+# libssl3 is declared rather than inherited: llama-server links OpenSSL directly
+# now, and depending on some other package to drag it in means the day the base
+# or the python3.11 dependency set changes, the binary stops being able to exec
+# at all — on a node, not here.
+#
+# NO curl either, for the same reason as Dockerfile.client: nothing in the image
+# invokes one (start.sh runs `python -m client.entrypoint`, the client speaks
+# HTTPS through httpx, and the kubelet probes from outside the container), and
+# this image runs as root with hostNetwork and hostPID.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    libgomp1 \
+    iptables \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python
+
+# The llama.cpp binaries and the CUDA-linked shared objects they need, both
+# staged in the builder so this copies only what the image keeps.
+COPY --from=llama-builder /out/bin/ /usr/local/bin/
+COPY --from=llama-builder /out/lib/ /usr/local/lib/
+# Not under /etc/aureax — the DaemonSet mounts a hostPath there, masking it.
+COPY --from=llama-builder /build/llama-build.json /usr/local/share/aureax-llama-build.json
+RUN ldconfig
+
+# Install uv. PINNED, and pinned to the SAME version as Dockerfile.client — see
+# the comment there. Nodes are built independently, on different days.
+COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+# Layer order: lockfile and dependencies BEFORE source, so a Python-only change
+# is a cache hit for everything above. See Dockerfile.client for the full note.
+COPY pyproject.toml uv.lock* ./
+
+# Install Python dependencies FROM THE LOCKFILE.
+#
+# `uv pip install .` resolves pyproject's ranges afresh and ignores uv.lock, so
+# each node image would pick up whatever was newest at ITS build time and a
+# minor-version jump in a dependency would reach the nodes without appearing in
+# any diff.
+#
+# Reproducibility is not cosmetic here: every peer in a sharded group must run
+# the same software, and the nodes are rebuilt independently of each other.
+RUN uv export --frozen --no-dev --no-emit-project -o /tmp/requirements.txt && \
+    uv pip install --system --no-cache -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
+
+# Source last — everything below this line rebuilds on a code change.
+#
+# README.md and LICENSE are here rather than with pyproject.toml so a docs edit
+# does not invalidate the dependency layer above. The wheel build below needs
+# both: pyproject declares `readme` and `license-files`, so without them the
+# installed package carries no description and no MIT license text.
+#
+# build_support.py and orchestrator/_resource_manifest.py are build inputs, not
+# runtime code — see Dockerfile.client. The wheel build below reads both, so a
+# tree missing either fails here rather than shipping an incomplete package.
+COPY README.md LICENSE build_support.py ./
+COPY client/ ./client/
+COPY orchestrator/config/schema.py ./orchestrator/config/schema.py
+COPY orchestrator/__init__.py ./orchestrator/__init__.py
+COPY orchestrator/_resource_manifest.py ./orchestrator/_resource_manifest.py
+COPY orchestrator/config/__init__.py ./orchestrator/config/__init__.py
+
+RUN uv pip install --system --no-cache --no-deps .
+
+# Only /tmp/aureax is real at runtime — the DaemonSets hostPath-mount
+# /opt/aureax and mask anything the image put there.
+RUN mkdir -p /tmp/aureax
+
+# Expose ports: llama-server (8080), MCP server (9000), llama.cpp RPC (50052)
+EXPOSE 8080 9000 50052
+
+# Environment
+ENV LLAMA_SERVER_PATH=/usr/local/bin/llama-server
+ENV RPC_SERVER_PATH=/usr/local/bin/rpc-server
+ENV AUREAX_CONFIG_PATH=/etc/aureax/aureax-edge.yaml
+
+# Surfaced so drift between group members is detectable before it becomes a
+# hung RPC handshake.
+ARG LLAMA_CPP_VERSION=b10375
+LABEL io.aureax.llama-version="${LLAMA_CPP_VERSION}"
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# Entrypoint
+COPY docker/scripts/start.sh /start.sh
+RUN chmod +x /start.sh
+
+CMD ["/start.sh"]
