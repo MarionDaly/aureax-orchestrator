@@ -7,6 +7,8 @@
 #   - If cgroups were just enabled, exits with code 100 to signal "reboot needed"
 #     (consumed by k3s_agent.join_agent, which turns it into a "reboot and
 #     re-run setup-all.sh" message instead of a generic join failure)
+#   - Installs wireguard-tools and checks the wireguard kernel module (needed
+#     only by groups with wireguard.enabled, installed everywhere)
 #   - On a host with a working nvidia-smi: installs nvidia-container-toolkit
 #     (which adds NVIDIA's apt repo and GPG keyring), enables
 #     --default-runtime=nvidia, and removes the toolkit's minimal containerd
@@ -191,6 +193,33 @@ case "$CGROUP_STATE" in
         exit 1
         ;;
 esac
+
+# --- Step 1b: WireGuard tools ---
+# A node group can carry its rpc-server traffic over a WireGuard tunnel
+# (node_groups[].wireguard.enabled). Every node gets the tools and must have the
+# kernel module, so enabling the tunnel later needs nothing provisioned; the
+# tunnel's config and unit come from `aureax apply`, never from here.
+# setup-all.sh's Step 2c does the same for nodes that are already joined.
+# --no-install-recommends: the package recommends wireguard-dkms on a kernel
+# that does not advertise the module, which would pull headers and a compiler
+# onto the node to build a module the kernel usually already has.
+# Neither failure stops the join: the tunnel is opt-in per group and
+# `aureax apply` refuses to enable it on a node that lacks the tools or the
+# module, naming this step — a fleet that never enables it must still join.
+if ! dpkg -s wireguard-tools >/dev/null 2>&1; then
+    echo "Installing wireguard-tools..."
+    if ! { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends wireguard-tools; }; then
+        echo "WARNING: could not install wireguard-tools — only needed once a group sets wireguard.enabled;" >&2
+        echo "         fix the node's apt sources and re-run setup-all.sh before enabling the tunnel." >&2
+    fi
+fi
+if sudo modprobe wireguard 2>/dev/null; then
+    echo "wireguard: tools installed, kernel module available"
+else
+    echo "WARNING: the wireguard kernel module is not available on this node (modprobe wireguard failed)." >&2
+    echo "         Only needed once a group sets wireguard.enabled; this kernel was built without" >&2
+    echo "         CONFIG_WIREGUARD (Debian Bookworm's stock kernels have it)." >&2
+fi
 
 # --- Step 2: Install nvidia-container-toolkit on GPU hosts ---
 # Required for K3s to expose host GPUs to pods (libcuda.so.1 injection,

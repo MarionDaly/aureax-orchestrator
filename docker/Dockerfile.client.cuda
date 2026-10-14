@@ -29,12 +29,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# MUST match Dockerfile.client exactly. The RPC wire format is version-locked,
-# so a group whose members were built from different llama.cpp versions hangs
-# at the handshake rather than reporting an error. Mixed BACKENDS (CUDA here,
-# CPU there) are fine; mixed VERSIONS are not.
-ARG LLAMA_CPP_VERSION=b10375
-ARG LLAMA_CPP_COMMIT=ba360efe1f574ebae727aad64112d18ecedca85a
+# MUST match Dockerfile.client exactly — both ARGs. The RPC wire format is
+# version-locked to the llama.cpp COMMIT, so members built from different
+# commits hang at the handshake rather than reporting an error. Mixed BACKENDS
+# and ARCHITECTURES (CUDA x86_64 here, CPU aarch64 there) are fine: `aureax
+# start` and `group doctor` compare this image to an aarch64 head by the
+# commit in llama-build.json, since the binaries can never be byte-identical
+# across architectures. Mixed COMMITS are not.
+ARG LLAMA_CPP_VERSION=b11429
+ARG LLAMA_CPP_COMMIT=d81235049384534c167caea52b85a694f6103d14
 RUN git clone --depth 1 --branch ${LLAMA_CPP_VERSION} \
     https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
@@ -49,11 +52,19 @@ RUN git rev-parse HEAD > /build/llama-commit.txt && \
         echo "       LLAMA_CPP_VERSION was bumped without LLAMA_CPP_COMMIT (update both ARGs together)" >&2; \
         exit 1; \
     fi && \
-    printf '{"version":"%s","commit":"%s"}\n' \
-        "${LLAMA_CPP_VERSION}" "$(cat /build/llama-commit.txt)" > /build/llama-build.json
+    RPC_PROTO="$(awk '/define RPC_PROTO_MAJOR_VERSION/{a=$3} /define RPC_PROTO_MINOR_VERSION/{b=$3} \
+        /define RPC_PROTO_PATCH_VERSION/{c=$3} END{if (a!="" && b!="" && c!="") printf "%s.%s.%s", a, b, c}' \
+        ggml/include/ggml-rpc.h)" && \
+    if [ -z "${RPC_PROTO}" ]; then \
+        echo "ERROR: could not read RPC_PROTO_*_VERSION from ggml/include/ggml-rpc.h — upstream moved it;" >&2; \
+        echo "       the head's peer wait compares workers against this value (client/entrypoint.py)" >&2; \
+        exit 1; \
+    fi && \
+    printf '{"version":"%s","commit":"%s","rpc_proto":"%s"}\n' \
+        "${LLAMA_CPP_VERSION}" "$(cat /build/llama-commit.txt)" "${RPC_PROTO}" > /build/llama-build.json
 
 # -DLLAMA_OPENSSL=ON must stay in lockstep with Dockerfile.client: TLS is
-# mandatory fleet-wide, and at b10375 this is the option's exact spelling (there
+# mandatory fleet-wide, and at b11429 this is the option's exact spelling (there
 # is no LLAMA_SERVER_SSL, and a misspelt -D is merely an unused cache variable
 # CMake notes in passing before succeeding). It already defaults to ON; the line
 # is here so a future default flip shows up in a diff, and the ldd assertion
@@ -66,10 +77,19 @@ RUN git rev-parse HEAD > /build/llama-commit.txt && \
 # containerd), so a -march=native build is simply the faster one. A SECOND GPU
 # node changes that: it would need -DGGML_NATIVE=OFF plus an explicit x86-64
 # baseline that both nodes satisfy.
+#
+# The embedded web UI is pinned the same way as in Dockerfile.client: at
+# b11429 LLAMA_BUILD_UI defaults OFF and LLAMA_USE_PREBUILT_UI stays ON, so
+# configure fetches the prebuilt UI from Hugging Face, and under `git clone
+# --depth 1` llama.cpp's own BUILD_NUMBER is 1 — left alone the fetch would
+# land on `latest` and images built on different days would embed different UI
+# bytes. -DHF_UI_VERSION below names the pinned tag's asset instead. (Offline,
+# cmake falls back to `latest`, then to no UI, with only a WARNING.)
 RUN cmake -S . -B build -G Ninja \
     -DGGML_CUDA=ON \
     -DGGML_RPC=ON \
     -DLLAMA_OPENSSL=ON \
+    -DHF_UI_VERSION=${LLAMA_CPP_VERSION} \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF \
@@ -226,7 +246,7 @@ ENV AUREAX_CONFIG_PATH=/etc/aureax/aureax-edge.yaml
 
 # Surfaced so drift between group members is detectable before it becomes a
 # hung RPC handshake.
-ARG LLAMA_CPP_VERSION=b10375
+ARG LLAMA_CPP_VERSION=b11429
 LABEL io.aureax.llama-version="${LLAMA_CPP_VERSION}"
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility

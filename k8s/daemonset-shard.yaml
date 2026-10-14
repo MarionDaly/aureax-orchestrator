@@ -178,6 +178,18 @@ spec:
             #     6.90 weights + 1.00 KV + 0.02 recurrent + ~0.5 compute
             #     + ~0.4 rpc-server/supervisor  =  ~8.8 GiB
             #
+            # NOT IN THIS ARITHMETIC: pipeline-parallel input copies. At b11429
+            # RPC devices report async/events support, so a layer-split head
+            # runs with pipeline parallelism ("pipeline parallelism enabled" in
+            # its log) and ggml_backend_sched keeps GGML_SCHED_MAX_COPIES = 4
+            # copies of every cross-split input and every graph input per
+            # consuming backend. One attention-mask copy is 128 MiB at 128k
+            # context with a 512-token micro-batch, so up to ~512 MiB more per
+            # worker is possible. Every figure above was derived with pipeline
+            # parallelism OFF and the real growth is UNMEASURED: re-measure the
+            # peak worker's RSS on b11429, through a long prefill, before
+            # trusting this limit as headroom or as the tripwire below.
+            #
             # 11Gi IS A TRIPWIRE, NOT JUST HEADROOM. It sits deliberately above
             # that ~8.8 GiB peak and BELOW the ~12.8 GiB the same worker needs if
             # flash attention is off — because without it llama.cpp reserves an
@@ -251,9 +263,18 @@ spec:
           # worker exits its container and K8s restarts the pod. And the head
           # independently waits for every peer's RPC port before loading
           # (::_wait_for_rpc_workers), which also covers pod restarts.
+          #
+          # exec, not tcpSocket: a tcpSocket probe can only dial the pod IP —
+          # here the node's LAN address — but a worker whose group has
+          # `wireguard.enabled` binds its tunnel address instead, and the
+          # kubelet's dial would be refused until the probe budget ran out.
+          # client/rpc_probe.py dials what resolve_rpc_host says rpc-server
+          # binds, so it is the same single connect to the same address on a
+          # LAN-bound worker. See ARCHITECTURE.md, "WireGuard transport for
+          # rpc-server".
           startupProbe:
-            tcpSocket:
-              port: 50052
+            exec:
+              command: ["/usr/local/bin/python", "-m", "client.rpc_probe"]
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 5

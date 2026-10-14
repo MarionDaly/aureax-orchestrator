@@ -590,7 +590,12 @@ def fleet_ca(monkeypatch):
 def test_the_auth_probe_path_is_behind_the_key(tmp_aureax_home):
     """/props is chosen because it is NOT auth-exempt on the pinned build. Point
     this at an exempt path and every keyed node probes 200 — "drift" for a fleet
-    that is perfectly configured, with nothing failing."""
+    that is perfectly configured, with nothing failing.
+
+    /models and /v1/models need the key at the pinned b11429, but they stay in
+    the excluded set on purpose: both were exempt through b10375 (removed in
+    b10518), so a node still running an old image would probe "open" on them
+    with its key enforced — exactly that false drift."""
     assert access_service._AUTH_PROBE_PATH not in {
         "/health", "/v1/health", "/models", "/v1/models", "/",
     }

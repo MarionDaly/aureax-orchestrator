@@ -27,7 +27,7 @@ before reaching for the assert.
 1. The rollback's per-worker share is NOT checked against ``requests``.
    ``71.7 GB -> 66.78 GiB / 7 = 9.54 GiB`` against ``requests.memory: "8Gi"``.
    That is not a bug: ``requests`` is a scheduling reservation and ``limits``
-   is the OOM ceiling, and ``k8s/daemonset-shard.yaml:159-161`` claims only the
+   is the OOM ceiling, and ``k8s/daemonset-shard.yaml:203-205`` claims only the
    11Gi limit for the rollback, never the request. R1 is therefore scoped to
    the groups a fleet file actually configures; R5 is where the rollback's
    memory is genuinely covered.
@@ -87,24 +87,32 @@ GIB = 2**30
 # Reading a registry number as GiB overstates every headroom below by 7%.
 GB = 10**9
 
-# k8s/daemonset-shard.yaml:145-147 — "6.90 weights + 1.00 KV + 0.02 recurrent
+# k8s/daemonset-shard.yaml:178-179 — "6.90 weights + 1.00 KV + 0.02 recurrent
 # + ~0.5 compute + ~0.4 rpc-server/supervisor = ~8.8 GiB". This is the sum of
 # the non-weight terms for the PEAK worker (the middle one: an even
 # tensor_split is not an even footprint).
+#
+# NOT INCLUDED: pipeline-parallel input copies. At b11429 a layer-split RPC
+# head runs with pipeline parallelism, and ggml_backend_sched keeps
+# GGML_SCHED_MAX_COPIES = 4 copies of every cross-split input and every graph
+# input per consuming backend — up to ~512 MiB more per worker at 128k context
+# (one 512-token mask copy is 128 MiB). This constant was derived with pipeline
+# parallelism off and the real growth is unmeasured: re-measure the peak
+# worker's RSS on b11429 before trusting it, and change it then, not before.
 PEAK_OVERHEAD_GIB = 1.92
 
-# k8s/daemonset-shard.yaml:159-161 — the 122B rollback's 9.5 GiB share becomes
+# k8s/daemonset-shard.yaml:203-205 — the 122B rollback's 9.5 GiB share becomes
 # "~10.0 GiB with overhead". SMALLER than PEAK_OVERHEAD_GIB because
 # configs/aureax-shard-head.yaml runs 4096 context, not 131072, so its KV term
 # is negligible. Two constants rather than an average: an average passes a case
 # that neither manifest number supports.
 ROLLBACK_OVERHEAD_GIB = 0.5
 
-# k8s/daemonset-shard.yaml:150-153 — the [n_kv x n_ubatch x n_head_q] F32 score
+# k8s/daemonset-shard.yaml:193-197 — the [n_kv x n_ubatch x n_head_q] F32 score
 # tensor llama.cpp reserves when flash attention is OFF, at 131072 / 512 / 16.
 FA_OFF_SCORE_TENSOR_GIB = 4.00
 
-# scripts/update-all.sh:378 — "Cold load measures ~17 s/GB".
+# scripts/update-all.sh:402 — "Cold load measures ~17 s/GB".
 COLD_LOAD_SECONDS_PER_GB = 17
 
 
@@ -144,7 +152,7 @@ def _quantity_gib(value: str) -> float:
 
 
 def _shard_memory() -> tuple[float, float]:
-    """(requests, limits) worker memory in GiB, from k8s/daemonset-shard.yaml:175-179."""
+    """(requests, limits) worker memory in GiB, from k8s/daemonset-shard.yaml:219-223."""
     manifest = YAML().load(SHARD_DAEMONSET.read_text())
     containers = manifest["spec"]["template"]["spec"]["containers"]
     sized = [c for c in containers if "resources" in c]
@@ -212,11 +220,29 @@ class GroupFacts:
     health_timeout: int
     context_size: int
     flash_attention: object
+    # Layers the group keeps on the head (node_groups.head_layers); 0 is the
+    # layout every group has run so far. With a positive count the workers
+    # share only the remaining layers, and the share below shrinks by the
+    # offloaded fraction of the n_layer + 1 placement slots (the extra slot is
+    # the output tensor, which always lands on the last worker). The layer
+    # count comes from the registry entry's `layers:` hint; without it a
+    # head-resident layout cannot be sized here and the test says so.
+    head_layers: int = 0
+    layers: int | None = None
 
     @property
     def share_gib(self) -> float:
         """This group's per-worker share of the weights, in GiB."""
-        return self.model.size_gb * GB / GIB / self.n_workers
+        total = self.model.size_gb * GB / GIB
+        if self.head_layers > 0:
+            assert self.layers, (
+                f"group {self.name!r} keeps {self.head_layers} layers on the head but the "
+                f"registry entry for {self.model.filename!r} has no `layers:` hint, so the "
+                "workers' share cannot be sized — add the model's block_count there"
+            )
+            slots = self.layers + 1
+            total *= (slots - self.head_layers) / slots
+        return total / self.n_workers
 
     @property
     def give_up_seconds(self) -> int:
@@ -224,7 +250,8 @@ class GroupFacts:
         return self.worker_wait + self.health_timeout
 
 
-def _head_facts(network_config, target, name: str, head_id: str, n_workers: int) -> GroupFacts:
+def _head_facts(network_config, target, name: str, head_id: str, n_workers: int,
+                head_layers: int = 0) -> GroupFacts:
     path = CONFIGS_DIR / target.config_file
     assert path.exists(), f"{head_id} names a config_file that is not in configs/"
     raw = load_edge_config_raw(path)
@@ -240,16 +267,19 @@ def _head_facts(network_config, target, name: str, head_id: str, n_workers: int)
     if hardcoded is not None:
         worker_wait = max(worker_wait, hardcoded)
 
+    entry = _model_for(network_config, model.get("filename"))
     return GroupFacts(
         name=name,
         head_id=head_id,
         head_config=target.config_file,
         n_workers=n_workers,
-        model=_model_for(network_config, model.get("filename")),
+        model=entry,
         worker_wait=worker_wait,
         health_timeout=int(server.get("health_timeout_seconds", DEFAULT_HEALTH_TIMEOUT_SECONDS)),
         context_size=int(server.get("context_size", 0)),
         flash_attention=server.get("flash_attention"),
+        head_layers=head_layers,
+        layers=entry.layers,
     )
 
 
@@ -276,7 +306,8 @@ def _groups_under_test(network_config: Path) -> list[GroupFacts]:
         assert target is not None, f"group {group.name!r} names an unknown head"
         assert target.config_file, f"group {group.name!r} head has no config_file"
         facts.append(
-            _head_facts(cfg, target, group.name, group.head, len(group.workers))
+            _head_facts(cfg, target, group.name, group.head, len(group.workers),
+                        head_layers=group.head_layers)
         )
     return facts
 
@@ -467,11 +498,11 @@ def test_edge_wait_outlasts_a_cold_load_of_every_deployed_and_rollback_model(
 ) -> None:
     """R7. The health poll has to survive a genuine cold load, not a warm one.
 
-    A worker's tensor cache is invalidated by any change to the worker count,
-    so the first start after a resize is always cold, and cold load is flat in
-    peer count: the head ships the same total bytes either way. A ceiling below
-    that streaming time declares a healthy fleet broken every time it is
-    resized.
+    A fresh node or a wiped tensor cache makes a fully cold load, and a resize
+    a partial one (the cache is content-addressed, so a worker misses only the
+    tensors it never received); cold load is flat in peer count: the head
+    ships the same total bytes either way. A ceiling below that streaming time
+    declares a healthy fleet broken every time a node is re-imaged.
     """
     ceiling = max(_script_assignments(UPDATE_ALL, "EDGE_WAIT"))
     groups = list(_require_groups(network_config))

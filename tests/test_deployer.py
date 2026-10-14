@@ -17,6 +17,8 @@ stage file leaves a private key in a login user's home.
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -1004,3 +1006,347 @@ def test_full_deploy_labels_only_the_head_role(deployer, monkeypatch) -> None:
     deployer.full_deploy()
 
     assert seen == [{"args": (), "kwargs": {"role": HEAD_ROLE}}]
+
+
+# --- rpc-cache manifest push ----------------------------------------------------
+
+
+def _record_fleet_push(deployer, monkeypatch):
+    uploads: list[tuple[str, str]] = []
+    commands: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        deployer_mod, "upload_files",
+        lambda host, items, **k: uploads.extend((host, Path(local).name) for local, _r, _m, _pm in items),
+    )
+    monkeypatch.setattr(
+        deployer_mod, "run_command",
+        lambda host, cmd, **k: (commands.append((host, cmd)), (0, "", ""))[1],
+    )
+    return uploads, commands
+
+
+def test_shard_workers_receive_their_heads_rpc_cache_manifest(deployer, monkeypatch, tmp_path) -> None:
+    """A worker holds a share of its HEAD's model, so the manifest is the head
+    model's, found by the filename in the head's generated config. Heads and
+    standalone nodes hold the GGUF itself and get nothing extra."""
+    gen = tmp_path / "gen"
+    gen.mkdir()
+    paths = {n: gen / f"aureax-edge-{n}.yaml" for n in ("head", "w1", "w2", "solo", "planner")}
+    paths["head"].write_text("model:\n  filename: m.gguf\n")
+    for n in ("w1", "w2", "solo", "planner"):
+        paths[n].write_text("model: {}\n")
+    deployer.models_dir = tmp_path / "models"
+    deployer.models_dir.mkdir()
+    (deployer.models_dir / "m.gguf.rpc-manifest.json").write_text('{"entries": []}')
+
+    uploads, commands = _record_fleet_push(deployer, monkeypatch)
+    deployer.deploy_configs(list(paths.values()))
+
+    got_manifest = {h for h, name in uploads if name == "m.gguf.rpc-manifest.json"}
+    assert got_manifest == {"10.77.0.2", "10.77.0.3"}
+    installs = {h: cmd for h, cmd in commands}
+    assert deployer_mod.NODE_RPC_CACHE_MANIFEST in installs["10.77.0.2"]
+    assert "chmod 0644 " + deployer_mod.NODE_RPC_CACHE_MANIFEST in installs["10.77.0.3"]
+    assert deployer_mod.NODE_RPC_CACHE_MANIFEST not in installs["10.77.0.1"]
+    assert deployer_mod.NODE_RPC_CACHE_MANIFEST not in installs["10.77.0.4"]
+
+
+def test_no_manifest_means_the_push_is_unchanged(deployer, monkeypatch, tmp_path) -> None:
+    """A fleet that never ran seed-rpc-cache.py pushes exactly the four files."""
+    gen = tmp_path / "gen"
+    gen.mkdir()
+    paths = [gen / f"aureax-edge-{n}.yaml" for n in ("head", "w1", "w2", "solo", "planner")]
+    paths[0].write_text("model:\n  filename: m.gguf\n")
+    deployer.models_dir = tmp_path / "models"   # absent on purpose
+
+    uploads, commands = _record_fleet_push(deployer, monkeypatch)
+    deployer.deploy_configs(paths)
+
+    per_host = {}
+    for h, name in uploads:
+        per_host.setdefault(h, []).append(name)
+    assert all(len(names) == 4 for names in per_host.values()), per_host
+    assert all(deployer_mod.NODE_RPC_CACHE_MANIFEST not in cmd for _h, cmd in commands)
+
+
+# --- WireGuard rides the same push, and only for enabled groups ---------------
+
+
+def _fixed_stage_path(prefix: str, suffix: str = "") -> tuple[str, str]:
+    """``ssh.stage_path`` with the random part removed, so a whole install
+    command can be compared as one string."""
+    rel = f".aureax-stage/{prefix}{suffix}"
+    return rel, f'"$HOME"/{rel}'
+
+
+# The install commands a fleet with NO WireGuard ran before the transport
+# existed, spelled out byte for byte. Opting a group into WireGuard must not
+# change a single character for any node outside it — this is the proof.
+_NO_WG_INSTALL = (
+    "sudo mkdir -p /etc/aureax /etc/aureax/tls /opt/aureax/models && "
+    "sudo chmod 0700 /etc/aureax/tls && "
+    'sudo mv "$HOME"/.aureax-stage/aureax-edge.yaml /etc/aureax/aureax-edge.yaml && '
+    'sudo mv "$HOME"/.aureax-stage/aureax-ca.pem /etc/aureax/tls/ca.pem && '
+    'sudo mv "$HOME"/.aureax-stage/aureax-node.pem /etc/aureax/tls/node.pem && '
+    'sudo mv "$HOME"/.aureax-stage/aureax-node.key /etc/aureax/tls/node.key && '
+    "sudo chown root:root /etc/aureax/aureax-edge.yaml /etc/aureax/tls "
+    "/etc/aureax/tls/ca.pem /etc/aureax/tls/node.pem /etc/aureax/tls/node.key && "
+    "sudo chmod 0600 /etc/aureax/aureax-edge.yaml /etc/aureax/tls/node.key && "
+    "sudo chmod 0644 /etc/aureax/tls/ca.pem /etc/aureax/tls/node.pem && "
+    "sudo chown aureax: /opt/aureax/models"
+)
+
+
+@pytest.mark.parametrize("node_id", ["solo", "head", "w1"])
+def test_a_fleet_without_wireguard_runs_the_exact_install_command_it_always_ran(
+    deployer, monkeypatch, node_id
+) -> None:
+    monkeypatch.setattr(deployer_mod, "stage_path", _fixed_stage_path)
+    uploads, cmds = _record_push(deployer, monkeypatch, node_id=node_id)
+
+    assert cmds == [_NO_WG_INSTALL]
+    assert len(uploads) == 4
+    assert not any("wireguard" in remote or "wg0" in remote for _l, remote, _k in uploads)
+
+
+WG_GROUP = {**GROUP, "wireguard": {"enabled": True}}
+
+_WG_PREFLIGHT = (
+    "{ command -v wg-quick >/dev/null 2>&1 || { echo 'wireguard-tools is not installed on this "
+    "node (no wg-quick); ./scripts/setup-all.sh installs it' >&2; exit 1; }; } && "
+    "{ sudo modprobe wireguard || { echo 'the wireguard kernel module is not available on this "
+    "node (modprobe wireguard failed)' >&2; exit 1; }; } && "
+)
+_WG_INSTALL = (
+    "sudo mkdir -p /etc/wireguard && "
+    "sudo chown root:root /etc/wireguard && "
+    "sudo chmod 0700 /etc/wireguard && "
+    'if sudo cmp -s "$HOME"/.aureax-stage/aureax-wg.conf /etc/wireguard/wg0.conf; '
+    "then wg_changed=0; else wg_changed=1; fi && "
+    'sudo mv "$HOME"/.aureax-stage/aureax-wg.conf /etc/wireguard/wg0.conf && '
+    "sudo chown root:root /etc/wireguard/wg0.conf && "
+    "sudo chmod 0600 /etc/wireguard/wg0.conf && "
+    "sudo systemctl enable --now wg-quick@wg0 && "
+    '{ [ "$wg_changed" = 0 ] || sudo systemctl restart wg-quick@wg0; } && '
+)
+_FINAL_CHOWN = "sudo chown aureax: /opt/aureax/models"
+
+
+@pytest.fixture
+def wg_deployer(deployer):
+    """`deployer` with its group on WireGuard and every member's pair minted
+    (tls_material has already pointed $HOME at tmp_path)."""
+    from orchestrator.config import wgstore
+
+    deployer.config = make_network_config(
+        make_targets("head", "w1", "w2", "solo", "planner"), [WG_GROUP]
+    )
+    for node_id in ("head", "w1", "w2"):
+        wgstore.ensure_key(node_id)
+    return deployer
+
+
+@pytest.mark.parametrize("node_id", ["head", "w1"])
+def test_a_wireguard_member_gets_its_wg0_conf_in_the_same_push(wg_deployer, monkeypatch, node_id) -> None:
+    """Fifth file, same connection, same chain; staged 0600 because it carries
+    the node's private key inline, exactly like node.key."""
+    from orchestrator.config.templating import render_wg_config
+
+    contents: dict[str, str] = {}
+    real_upload = []
+
+    def upload(_host, items, **_k):
+        for local, remote, mode, parent_mode in items:
+            real_upload.append((Path(local).name, remote, mode, parent_mode))
+            if Path(local).name == "wg0.conf":  # the only one of the five on disk here
+                contents[remote] = Path(local).read_text()
+
+    monkeypatch.setattr(deployer_mod, "stage_path", _fixed_stage_path)
+    monkeypatch.setattr(deployer_mod, "upload_files", upload)
+    cmds: list[str] = []
+    monkeypatch.setattr(deployer_mod, "run_command", lambda _h, cmd, **_k: cmds.append(cmd) or (0, "", ""))
+
+    wg_deployer.deploy_configs(
+        [Path(f"/tmp/aureax-edge-{node_id}.yaml")],
+        targets=[t for t in wg_deployer._targets if t.node_id == node_id],
+    )
+
+    assert [name for name, *_ in real_upload] == [
+        f"aureax-edge-{node_id}.yaml", "ca.pem", f"{node_id}.pem", f"{node_id}.key", "wg0.conf",
+    ]
+    _name, remote, mode, parent_mode = real_upload[-1]
+    assert (mode, parent_mode) == (0o600, 0o700)
+    assert remote == ".aureax-stage/aureax-wg.conf"
+    assert contents[remote] == render_wg_config(node_id, wg_deployer.config)
+    # The whole command, byte for byte: the preflight before anything moves,
+    # the unchanged mandatory chain, then the tunnel beside the manifest slot.
+    assert cmds == [
+        _WG_PREFLIGHT + _NO_WG_INSTALL.removesuffix(_FINAL_CHOWN) + _WG_INSTALL + _FINAL_CHOWN
+    ]
+
+
+@pytest.mark.parametrize("node_id", ["solo", "planner"])
+def test_nodes_outside_the_tunnel_push_exactly_what_they_always_did(
+    wg_deployer, monkeypatch, node_id
+) -> None:
+    monkeypatch.setattr(deployer_mod, "stage_path", _fixed_stage_path)
+    uploads, cmds = _record_push(wg_deployer, monkeypatch, node_id=node_id)
+
+    assert cmds == [_NO_WG_INSTALL]
+    assert len(uploads) == 4
+
+
+def test_the_local_wg0_conf_does_not_outlive_the_push(wg_deployer, monkeypatch, tmp_path) -> None:
+    """The key store already holds the private key; a second long-lived copy
+    on the Mac buys nothing. Removed on success and on failure alike."""
+    seen: list[Path] = []
+
+    def upload(_host, items, **_k):
+        seen.extend(Path(local) for local, *_ in items if Path(local).name == "wg0.conf")
+
+    monkeypatch.setattr(deployer_mod, "upload_files", upload)
+    monkeypatch.setattr(deployer_mod, "run_command", lambda h, cmd, **_k: (1, "", "boom") if h == "10.77.0.3" else (0, "", ""))
+
+    paths = [Path(f"/tmp/aureax-edge-{t.node_id}.yaml") for t in wg_deployer._targets]
+    with pytest.raises(RuntimeError, match="config push failed for w2"):
+        wg_deployer.deploy_configs(paths)
+
+    assert len(seen) == 3, "head, w1 and w2 each get a wg0.conf"
+    for path in seen:
+        assert not path.exists() and not path.parent.exists(), path
+
+
+def test_a_failed_wireguard_push_cleans_up_the_staged_conf_too(wg_deployer, monkeypatch) -> None:
+    staged: list[str] = []
+    monkeypatch.setattr(
+        deployer_mod, "upload_files",
+        lambda _h, items, **_k: staged.extend(remote for _l, remote, _m, _pm in items),
+    )
+    cleanups: list[str] = []
+
+    def run(_host, cmd, **_k):
+        if cmd.startswith("rm -f"):
+            cleanups.append(cmd)
+            return 0, "", ""
+        return 1, "", "wireguard-tools is not installed on this node"
+
+    monkeypatch.setattr(deployer_mod, "run_command", run)
+    with pytest.raises(RuntimeError, match="config push failed for w1"):
+        wg_deployer.deploy_configs(
+            [Path("/tmp/aureax-edge-w1.yaml")],
+            targets=[t for t in wg_deployer._targets if t.node_id == "w1"],
+        )
+
+    wg_stage = next(s for s in staged if "aureax-wg" in s)
+    assert wg_stage in cleanups[0], "the staged wg0.conf (a private key) was left behind"
+    assert len([s for s in staged if s in cleanups[0]]) == 5
+
+
+def test_a_member_without_a_key_refuses_the_whole_push_before_any_node(wg_deployer, monkeypatch) -> None:
+    from orchestrator.config import wgstore
+
+    wgstore.key_paths("w2")[0].unlink()
+    touched: list[str] = []
+    monkeypatch.setattr(deployer_mod, "upload_files", lambda h, *_a, **_k: touched.append(h))
+    monkeypatch.setattr(deployer_mod, "run_command", lambda h, *_a, **_k: touched.append(h) or (0, "", ""))
+
+    paths = [Path(f"/tmp/aureax-edge-{t.node_id}.yaml") for t in wg_deployer._targets]
+    with pytest.raises(RuntimeError, match=r"w2 has no WireGuard key.*aureax generate"):
+        wg_deployer.deploy_configs(paths)
+    assert touched == [], "half a star was pushed"
+
+
+# --- the install chain's shell logic, executed --------------------------------
+# The string assertions above pin WHAT runs; this runs it, with every root path
+# moved under tmp_path and sudo/systemctl stubbed, to pin the two things a
+# string cannot show: wg-quick is restarted only when the file changed, and a
+# node without wireguard-tools is refused before anything is moved.
+
+
+def _wg_member_command() -> str:
+    return _WG_PREFLIGHT + _NO_WG_INSTALL.removesuffix(_FINAL_CHOWN) + _WG_INSTALL + _FINAL_CHOWN
+
+
+def _run_chain(root: Path, wg_conf: str, *, have_wg_quick: bool = True):
+    import subprocess
+
+    home = root / "home"
+    stage = home / ".aureax-stage"
+    stage.mkdir(parents=True, exist_ok=True)
+    for name in ("aureax-edge.yaml", "aureax-ca.pem", "aureax-node.pem", "aureax-node.key"):
+        (stage / name).write_text(name)
+    (stage / "aureax-wg.conf").write_text(wg_conf)
+    bin_dir = root / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    log = root / "systemctl.log"
+    (bin_dir / "sudo").write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        "  chown|modprobe) exit 0 ;;\n"
+        f'  systemctl) shift; echo "$*" >> "{log}"; exit 0 ;;\n'
+        "esac\n"
+        'exec "$@"\n'
+    )
+    (bin_dir / "sudo").chmod(0o755)
+    wg_quick = bin_dir / "wg-quick"
+    if have_wg_quick:
+        wg_quick.write_text("#!/bin/sh\nexit 0\n")
+        wg_quick.chmod(0o755)
+    else:
+        wg_quick.unlink(missing_ok=True)
+    cmd = _wg_member_command().replace("/etc/", f"{root}/etc/").replace("/opt/", f"{root}/opt/")
+    result = subprocess.run(
+        ["/bin/sh", "-c", cmd], capture_output=True, text=True, timeout=30,
+        env={"HOME": str(home), "PATH": f"{bin_dir}:/usr/bin:/bin"},
+    )
+    calls = log.read_text().splitlines() if log.exists() else []
+    log.unlink(missing_ok=True)
+    return result, calls
+
+
+@pytest.mark.skipif(os.name != "posix", reason="runs the chain under /bin/sh")
+def test_wg_quick_restarts_only_when_the_installed_file_changed(tmp_path) -> None:
+    root = tmp_path / "node"
+
+    first, calls = _run_chain(root, "conf v1\n")
+    assert first.returncode == 0, first.stderr
+    assert calls == ["enable --now wg-quick@wg0", "restart wg-quick@wg0"], "first install"
+    installed = root / "etc" / "wireguard" / "wg0.conf"
+    assert installed.read_text() == "conf v1\n"
+    assert stat.S_IMODE(installed.stat().st_mode) == 0o600
+    assert stat.S_IMODE(installed.parent.stat().st_mode) == 0o700
+
+    again, calls = _run_chain(root, "conf v1\n")
+    assert again.returncode == 0, again.stderr
+    assert calls == ["enable --now wg-quick@wg0"], "an unchanged tunnel was bounced"
+
+    changed, calls = _run_chain(root, "conf v2\n")
+    assert changed.returncode == 0, changed.stderr
+    assert calls == ["enable --now wg-quick@wg0", "restart wg-quick@wg0"]
+    assert installed.read_text() == "conf v2\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="runs the chain under /bin/sh")
+def test_a_node_without_wireguard_tools_is_refused_before_anything_moves(tmp_path) -> None:
+    root = tmp_path / "node"
+    result, calls = _run_chain(root, "conf\n", have_wg_quick=False)
+
+    assert result.returncode == 1
+    assert "wireguard-tools is not installed" in result.stderr
+    assert calls == []
+    assert not (root / "etc").exists(), "the preflight must run before the first mv"
+
+
+@pytest.mark.parametrize("script", ["setup-all.sh", "join-node.sh"])
+def test_provisioning_installs_what_the_wireguard_preflight_asks_for(script) -> None:
+    """The deploy preflight refuses a node without wg-quick by naming
+    ./scripts/setup-all.sh, so provisioning has to install it — on every node,
+    idempotently, without the dkms recommends — and has to fail clearly on a
+    kernel with no wireguard module. Text-level because both run on a node."""
+    from tests.conftest import PROJECT_ROOT
+
+    text = (PROJECT_ROOT / "scripts" / script).read_text()
+    assert "dpkg -s wireguard-tools" in text, "the install must be skipped when already present"
+    assert "apt-get install -y -qq --no-install-recommends wireguard-tools" in text
+    assert "modprobe wireguard" in text
+    assert "kernel module is not available" in text

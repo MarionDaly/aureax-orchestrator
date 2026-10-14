@@ -48,10 +48,12 @@ first runs `sudo` over SSH where a password prompt has no tty. Each needs RAM fo
 (its model plus KV cache, or in a group its share of the weights plus the group's context —
 derivation in
 [ARCHITECTURE.md → "Invariants and how each is enforced"](ARCHITECTURE.md#invariants-and-how-each-is-enforced))
-and disk for the GGUF if it loads one; workers hold no model file but keep a tensor cache under
-`/opt/aureax/rpc-cache`. Every peer in a group must run the byte-identical llama.cpp build: the RPC
-wire format is version-locked, and `aureax start` refuses a group whose members' `llama-server` /
-`rpc-server` checksums disagree.
+and disk for the GGUF if it loads one; workers hold no model file but keep their share of the
+weights on local disk, as a tensor cache under `/opt/aureax/rpc-cache`. Every peer in a group must
+run the same llama.cpp commit: the RPC wire format is version-locked, and `aureax start` refuses a
+group whose members' recorded commits disagree, or whose members of the head's architecture hold
+different `llama-server` / `rpc-server` checksums. A CUDA x86_64 member may join an aarch64 group; it
+is compared by commit.
 
 ---
 
@@ -208,6 +210,9 @@ uv run aureax tls regenerate [--ca --orchestrator-ip <IP>] [--node edge-01]
 uv run aureax group list              # members, endpoints and auth state per group
 uv run aureax group doctor [--name qwen35b-a]
 
+uv run aureax wg status               # per WireGuard group: subnet, member addresses, public keys
+uv run aureax wg regenerate --node shard-a1   # rotate a member's tunnel key (see Sharded model groups)
+
 uv run aureax bootstrap-keys          # install the public key on every password-auth node
 uv run aureax heal-nodes              # rewrite a stale K3S_URL after the LAN IP changed
 uv run aureax trust-host-key <node_id> --fingerprint SHA256:...   # optional, see Host keys
@@ -326,7 +331,9 @@ Stop at `/v1`: clients append `chat/completions` themselves, so the full path gi
 **model id** is whatever `alias` the node sets under `model.server` — without one, llama-server
 reports the GGUF's full path and clients must use that verbatim; an alias may not contain a comma,
 because llama.cpp parses `--alias` as a comma-separated list. Ask the node with `curl --cacert
-~/.aureax/tls/ca.pem https://<NODE_IP>:30800/v1/models`. llama.cpp's own chat UI is at
+~/.aureax/tls/ca.pem -H "Authorization: Bearer $(cat ~/.aureax/keys/<node_id>.key)"
+https://<NODE_IP>:30800/v1/models` — the key is needed on an auth-enabled node, `/v1/models`
+included. llama.cpp's own chat UI is at
 `https://<NODE_IP>:30800/`, and the same server is reachable as `:8080` directly on the node,
 because the pod runs with `hostNetwork` — `:30800` is not the only door.
 
@@ -352,13 +359,13 @@ replaces the key in the same step: rotating without applying would leave the ser
 old key while every client sends the new one, which is why rotation is a flag on `apply` rather
 than its own command. Delete the line and repeat both commands to turn auth off.
 
-**Exempt endpoints.** On the pinned build (`b10375`, `ARG LLAMA_CPP_VERSION` in both Dockerfiles),
-`/health`, `/v1/health`, `/models`, `/v1/models`, `/` and the web-UI assets answer without a key —
-the Kubernetes probes and a client's model discovery depend on that. Everything else, `/metrics`
-included, returns 401 without `Authorization: Bearer <key>`. The list is build-specific: upstream
-narrowed the two `/models` routes right after `b10375`, so a `LLAMA_CPP_VERSION` bump can start
-requiring a key there, and `test-all.sh` section 7 checks unauthenticated `/v1/models` as the
-tripwire. Details in
+**Exempt endpoints.** On the pinned build (`b11429`, `ARG LLAMA_CPP_VERSION` in both Dockerfiles),
+only `/health`, `/v1/health`, `/` and the web-UI assets answer without a key (and `OPTIONS`
+requests skip auth) — the Kubernetes probes depend on `/health`. Everything else, `/metrics`,
+`/models` and `/v1/models` included, returns 401 without `Authorization: Bearer <key>`, so a
+client's model discovery needs the key too. The list is build-specific: `/models` and
+`/v1/models` were exempt through `b10375` and upstream removed that exemption in `b10518`, and
+`test-all.sh` section 7 checks that unauthenticated `/v1/models` is now 401. Details in
 [ARCHITECTURE.md → "llama-server API-key authentication"](ARCHITECTURE.md#llama-server-api-key-authentication).
 
 ### MCP
@@ -394,7 +401,9 @@ matches); `aureax tls status` reports the CA, its name constraints and every lea
 `aureax tls regenerate` forces a reissue. Point command-line clients at the CA file:
 
 ```bash
-curl --cacert "$(uv run aureax tls ca-path)" https://<NODE_IP>:30800/v1/models
+curl --cacert "$(uv run aureax tls ca-path)" \
+  -H "Authorization: Bearer $(cat ~/.aureax/keys/<node_id>.key)" \
+  https://<NODE_IP>:30800/v1/models
 export AUREAX_CA=~/.aureax/tls/ca.pem       # read by the scripts and the harness
 ```
 
@@ -543,11 +552,14 @@ head:
 ```bash
 uv run aureax group list                                   # members, endpoints, auth
 uv run aureax-harness infer <HEAD_NODE_ID> "What is 2+2?"  # MCP    :30900
-curl --cacert ~/.aureax/tls/ca.pem https://<HEAD_IP>:30800/v1/models   # llama :30800
+curl --cacert ~/.aureax/tls/ca.pem \
+  -H "Authorization: Bearer $(cat ~/.aureax/keys/<HEAD_NODE_ID>.key)" \
+  https://<HEAD_IP>:30800/v1/models                         # llama :30800
 ```
 
-That `/v1/models` call keeps working with API-key auth on — see
-[Exempt endpoints](#llama-server-api-keys). A cognitive planner picks up every group automatically:
+That `/v1/models` call needs the head's key on the pinned build — it was auth-exempt only through
+`b10375`; see [Exempt endpoints](#llama-server-api-keys).
+A cognitive planner picks up every group automatically:
 its `remote_servers` is derived from `${mcp_endpoints}`, which resolves to every enabled target
 whose own config has `mcp.server.enabled`, excluding itself, and carries each peer's MCP key.
 Nothing is listed by hand.
@@ -567,23 +579,48 @@ Nothing is listed by hand.
   honoured only because the flag is always emitted. `llama-server.log`'s "Flash Attention enabled"
   line is the only runtime source of truth.
 - **The first load is cold and takes minutes.** The head streams every tensor to its workers before
-  the endpoint answers, so a pod sits `0/1 Running` throughout. Changing a group's worker count
-  invalidates every worker's tensor cache, so the first start after a resize is always cold.
+  the endpoint answers, so a pod sits `0/1 Running` throughout. Each worker keeps what it received
+  in a content-addressed tensor cache (files named by a hash of the tensor's bytes), so a restart
+  reloads warm, and a resize or reorder re-ships only the tensors that land on a worker that never
+  held them. Up to b10375 that cache also kept long prompts' attention masks, about 1 GiB per
+  worker per 32k prompt and never deleted; upstream restricted it to weights in b10985, so the
+  pinned build (b11429) no longer writes them, and the worker supervisor's cache-hygiene step is
+  now a backstop that clears what an older image left behind.
 - **`rpc-server` on `:50052` is the fleet's one unauthenticated, plaintext port.** The host firewall
   is its only control, and the worker pod installs that firewall itself before RPC starts — see the
   note below.
-- **Every peer must run the byte-identical llama.cpp binaries**, or the head connects and then hangs
-  at the RPC handshake with no error on either side. `aureax start` and `aureax group doctor` both
-  ask each member for the sha256 of `llama-server` and `rpc-server` *inside its image*, over SSH, and
-  refuse a group whose members disagree — naming the odd node and the rebuild command. Not the image
-  digest: every node builds `aureax-client:dev` natively, so those differ across a perfectly coherent
-  group. A member that cannot be read is a warning, never a refusal.
+- **Every peer must run the same llama.cpp commit**, or the head connects and then hangs at the
+  RPC handshake with no error on either side. `aureax start` and `aureax group doctor` both ask each
+  member's image, over SSH, for the commit it was built from, its architecture and the sha256 of
+  `llama-server` and `rpc-server`, and refuse a group whose commits disagree, or whose members of the
+  head's architecture hold different binaries — naming the odd node and the rebuild command. A member
+  of another architecture (a CUDA x86_64 node in an aarch64 group) is compared by commit alone. Not
+  the image digest: every node builds `aureax-client:dev` natively, so those differ across a perfectly
+  coherent group. A member that cannot be read is a warning, never a refusal. The head's own peer
+  wait adds a protocol-level check: it sends each worker the RPC HELLO and refuses, by name and at
+  once, a worker whose protocol version differs from its own image's.
 
 The full list of invariants, and the check that enforces each, is in
 [ARCHITECTURE.md → "Invariants and how each is enforced"](ARCHITECTURE.md#invariants-and-how-each-is-enforced).
-When something is wrong, `uv run aureax group doctor` collects build ids, binary checksums, memory,
+When something is wrong, `uv run aureax group doctor` collects build ids, commits, image architectures, binary checksums, memory,
 NIC speed, RPC listeners, GGUF presence and recent logs from every member in one pass — and exits
 non-zero on a mismatched group, so it composes into a pre-flight check.
+
+**Pre-seeding the worker tensor cache.** `scripts/seed-rpc-cache.py` produces rpc-server's cache
+files offline from the GGUF, so a fresh or wiped worker's first load can be a warm one; it needs
+only the standard library and runs under a bare `python3`. `manifest <gguf> [--hash]` writes
+`<gguf>.rpc-manifest.json`: the file's name (`gguf`) and `size_bytes`, a `sha_note` saying the
+hashes are cache keys rather than digests, the `threshold` (10485760 bytes), and under `entries` one
+`{"name", "offset", "nbytes", "hash"}` per tensor over it, where `offset` is absolute in the file
+and `hash` is rpc-server's key — the FNV-1a-64 of the tensor's bytes as 16 hex digits — or `null`
+without `--hash`. `export <gguf> --manifest M --dest DIR [--only-hashed]` writes each entry to
+`DIR/<hash>` atomically, re-hashing every file before it gets its name; `verify DIR --manifest M
+[--delete-unknown] [--delete-mismatched]` audits a cache directory (`/opt/aureax/rpc-cache/rpc/` on
+a worker), reports files of the wrong size, which rpc-server would load as-is, and names the
+manifest does not list, such as cached masks, and exits 1 while any remain. A split GGUF takes one
+manifest per part. With `cc` on the path the hashing runs through a small C helper built into
+`~/.aureax/bin/fnv1a64` at about 1 GB/s; without it, pure Python takes tens of minutes for a 20 GB
+model. Putting an exported directory onto a worker is not automated yet.
 
 > **Security:** `rpc-server` has no authentication, speaks no TLS, and deserializes arbitrary
 > tensor graphs. Port 50052 must stay on a trusted LAN and must never reach a routable network.
@@ -612,6 +649,21 @@ that does not install and verify blocks startup, so a worker with no firewall ne
   process on that port has stopped, and do not start `rpc-server` by hand outside this pod.
 - Diagnose a worker that will not start with
   `kubectl -n aureax logs <worker-pod> -c rpc-firewall`; every refusal there is named.
+
+**Putting `:50052` behind WireGuard (opt-in, per group).** Set `wireguard.enabled: true` on a
+`node_groups` entry and the group's RPC traffic moves onto a kernel WireGuard star — the head is the
+hub, each worker a spoke, `10.254.<group index>.0/24` unless you set `subnet:`. Each worker's
+`rpc-server` then binds only its tunnel address and its firewall accepts only the head's tunnel
+address, on `wg0`. To turn it on: `aureax generate --orchestrator-ip <IP>` (mints a key pair per
+member), `aureax apply --all --orchestrator-ip <IP>` (installs `/etc/wireguard/wg0.conf` and starts
+`wg-quick@wg0` on every member), then `aureax stop && aureax start` — `apply` never restarts a worker,
+and a worker keeps listening on the LAN until its pod is recreated. Rotating a member's key is
+`aureax wg regenerate --node <id>`, then the same `apply` and `stop && start`. The expected cost at
+1 GbE is framing: about +0.5 ms per decoded token and ~5% less bulk goodput. Re-run
+`scripts/bench-decode.sh` against one group's head before enabling it everywhere, and watch worker
+CPU while it runs. Every node gets `wireguard-tools` from `setup-all.sh`, and a fleet that leaves
+`enabled` off generates and deploys exactly what it did before. Details:
+[ARCHITECTURE.md → "WireGuard transport for rpc-server"](ARCHITECTURE.md#wireguard-transport-for-rpc-server).
 
 ### Swapping a group's model
 

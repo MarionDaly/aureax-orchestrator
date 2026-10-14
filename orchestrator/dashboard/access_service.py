@@ -71,11 +71,12 @@ logger = logging.getLogger("aureax.dashboard.access")
 
 # The live-auth probe path. Requirements: it must be BEHIND --api-key (so 401
 # means secured), and cheap (no inference). Verified against the pinned build
-# b10375's source (tools/server/server-http.cpp): the auth-exempt set there is
-# exactly /health, /v1/health, /models, /v1/models and the web-UI assets —
-# /props is NOT in it, while GET /props is always served (the --props flag
-# gates POST only). /v1/models is unusable as a probe on this build: it is
-# exempt, so it always reads "open".
+# b11429's source (tools/server/server-http.cpp): the auth-exempt set there is
+# exactly /health, /v1/health, / and the web-UI assets (plus any OPTIONS
+# request) — /props is NOT in it, while GET /props is always served (the
+# --props flag gates POST only). /props rather than /v1/models because the
+# latter was exempt through b10375 (removed in b10518, #26347), so a node
+# still on an old image would read "open" on it even with a key enforced.
 _AUTH_PROBE_PATH = "/props"
 
 # Probe budgets. The TCP gate keeps a node that is down (or a host that no

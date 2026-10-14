@@ -503,6 +503,70 @@ UNIT
     fi
 done
 
+# ===================== STEP 2c: WIREGUARD TOOLS =====================
+#
+# A node group can carry its rpc-server traffic over a WireGuard star
+# (node_groups[].wireguard.enabled; ARCHITECTURE.md, "WireGuard transport for
+# rpc-server"). That needs wireguard-tools — `wg`, `wg-quick` and the
+# wg-quick@.service unit — and the kernel's wireguard module on the node.
+#
+# Installed on EVERY node, not only on members of an enabled group, so turning
+# the tunnel on later is `aureax generate` + `aureax apply` with nothing left to
+# provision. Nothing else happens here: the tunnel's config file and the unit's
+# enablement belong to the deployer (`aureax apply`), which refuses by name on a
+# node this step never reached. join-node.sh does the same for a node joined
+# outside this script.
+#
+# --no-install-recommends because the package recommends wireguard-dkms on a
+# kernel that does not advertise the module, which would pull headers and a
+# compiler onto the node to build a module the kernel usually already has.
+
+section_banner "Step 2c: Install WireGuard tools"
+
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    HOST="${NODE_HOSTS[$i]}"
+    USER="${NODE_USERS[$i]}"
+    KEY="${NODE_KEY_FILES[$i]}"
+    info "Checking WireGuard on ${HOST}..."
+
+    # One state token on stdout, the convention Step 2 uses, so a node that
+    # cannot install the package is told apart from one whose kernel lacks the
+    # module. An SSH failure is its own token rather than an abort under set -e.
+    WG_STATE=$(ssh_cmd "$HOST" "$USER" "$KEY" '
+        if ! dpkg -s wireguard-tools >/dev/null 2>&1; then
+            if ! { sudo apt-get update -qq >/dev/null 2>&1 &&
+                   sudo apt-get install -y -qq --no-install-recommends wireguard-tools >/dev/null 2>&1; }; then
+                echo APT_FAILED
+                exit 0
+            fi
+        fi
+        if sudo modprobe wireguard >/dev/null 2>&1; then echo OK; else echo NO_MODULE; fi
+    ') || WG_STATE="UNREACHABLE"
+
+    case "$WG_STATE" in
+        OK)
+            ok "${HOST}: wireguard-tools installed, wireguard kernel module available"
+            ;;
+        APT_FAILED)
+            # A warning, not a stop: the tunnel is opt-in per group, and the
+            # deployer refuses to enable it on a node that lacks the tools,
+            # naming this step. A fleet that never enables it must provision.
+            warn "${HOST}: could not install wireguard-tools (apt-get update/install failed) — only needed once a group sets wireguard.enabled; check the node's apt sources and re-run this step before enabling the tunnel"
+            exit 1
+            ;;
+        NO_MODULE)
+            # Same reasoning: a kernel without CONFIG_WIREGUARD can still run a
+            # firewalled group. `aureax apply` refuses the tunnel on this node
+            # until a kernel with the module is installed.
+            warn "${HOST}: the wireguard kernel module is not available (modprobe wireguard failed) — only needed once a group sets wireguard.enabled; this kernel was built without CONFIG_WIREGUARD (Debian Bookworm's stock kernels have it)"
+            ;;
+        *)
+            fail "${HOST}" "could not check WireGuard (${WG_STATE})"
+            exit 1
+            ;;
+    esac
+done
+
 # ===================== STEP 3: K3S CLUSTER ON MAC =====================
 
 section_banner "Step 3: Create or start K3s cluster (k3d on Mac)"

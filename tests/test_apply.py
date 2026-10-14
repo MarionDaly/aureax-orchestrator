@@ -10,8 +10,9 @@ deliberate asymmetries, each of which is a bug if it drifts:
 - the PUSH fans out to each requested node's whole GROUP (a group serves one
   model; its members' configs must stay consistent);
 - the RESTART set excludes shard workers entirely (rpc-server takes no API key,
-  and bouncing a worker invalidates its tensor cache — a ~107s warm head reload
-  becomes a ~280s cold one, for a change the worker cannot even use);
+  and bouncing a worker tears its group down for a reload — warm, ~107s, since
+  the content-addressed tensor cache survives the restart, but still minutes of
+  outage for a change the worker cannot even use);
 - a changed MCP key widens the push BEYOND the group, to every node whose
   template consumes ${mcp_endpoints}: those configs embed their peers' keys, so
   an unpushed consumer keeps dialling with the old one and 401s on every call.
@@ -122,10 +123,11 @@ def test_applying_to_a_worker_pushes_to_the_whole_group(applier) -> None:
 
 
 def test_only_the_head_is_restarted(applier) -> None:
-    """rpc-server takes no API key and holds a tensor cache worth minutes.
+    """rpc-server takes no API key, and a restart costs the group minutes.
 
-    Restarting a worker tears the whole group down and forces a cold reload of
-    the head — for a config change the worker has no use for.
+    Restarting a worker tears the whole group down and forces a reload of the
+    head — warm from the worker's tensor cache, but still minutes — for a
+    config change the worker has no use for.
     """
     outcomes = _apply(applier, ["w1"])
 
@@ -425,7 +427,7 @@ def test_restart_never_uses_rollout_restart(applier, monkeypatch) -> None:
     """`kubectl rollout restart daemonset/...` bounces the ENTIRE fleet.
 
     A DaemonSet rollout is serial, so applying a one-node config change would
-    cold-reload every head in the fleet — minutes per member. The apply path
+    reload every head in the fleet — minutes per member. The apply path
     may only ever delete the one pod on the one node.
 
     Stubbed at the subprocess boundary rather than at the kubectl helpers, so
@@ -490,7 +492,7 @@ def test_every_pod_is_deleted_before_any_wait_begins(applier, monkeypatch) -> No
 
     With the delete and the wait in one loop, node N+1's pod was not deleted
     until node N came back Ready, so `apply --all --wait` reloaded the fleet's
-    heads one after another — minutes of cold load each, serially. The cost of
+    heads one after another — minutes of load each, serially. The cost of
     the fix is that every head reloads at once, which is a real availability
     tradeoff and is why the two passes have to stay visible here.
     """

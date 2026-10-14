@@ -6,15 +6,19 @@ from __future__ import annotations
 import contextlib
 import logging
 import shlex
+import shutil
+import tempfile
 from pathlib import Path, PurePosixPath
 
 from orchestrator.cluster import k3d, kubectl, labels
 from orchestrator.config import tlsstore
+from orchestrator.config.atomic import write_private_file
 from orchestrator.config.cache import load_network_config_cached
 from orchestrator.config.loader import generated_config_dir, generated_config_path
-from orchestrator.config.schema import HEAD_ROLE, SHARD_WORKER_ROLE, node_role
+from orchestrator.config.schema import HEAD_ROLE, SHARD_WORKER_ROLE, WG_INTERFACE, node_role
 from orchestrator.config.templating import (
     generate_all_edge_configs,
+    render_wg_config,
     template_references_mcp_endpoints,
 )
 from orchestrator.deploy.k3s_agent import join_agent
@@ -40,6 +44,19 @@ JOIN_TIMEOUT_SECONDS = 900
 # reading paths nothing ever wrote — a fleet-wide crash-loop whose only symptom
 # is an exit code.
 NODE_TLS_DIR = str(PurePosixPath(tlsstore.NODE_CA_FILE).parent)
+
+# Where a shard worker's supervisor reads the tensor-cache manifest from
+# (client/entrypoint.py::_RPC_CACHE_MANIFEST names the same path; the client
+# cannot import this module). A fixed name, like the TLS files: renaming a
+# node or its model must not strand a manifest.
+NODE_RPC_CACHE_MANIFEST = "/etc/aureax/rpc-cache-manifest.json"
+# A WireGuard group member's tunnel, as wg-quick knows it: the unit
+# wg-quick@<iface> reads /etc/wireguard/<iface>.conf. Installed by
+# deploy_configs only for members of a group with `wireguard.enabled`; every
+# other node's push is exactly what it was before the tunnel existed.
+NODE_WG_DIR = "/etc/wireguard"
+NODE_WG_CONF = f"{NODE_WG_DIR}/{WG_INTERFACE}.conf"
+NODE_WG_UNIT = f"wg-quick@{WG_INTERFACE}"
 
 
 class Deployer:
@@ -72,6 +89,11 @@ class Deployer:
         self.k8s_dir = config_path.parent.parent / "k8s"
         if not self.k8s_dir.is_dir():
             self.k8s_dir = resource_root() / "k8s"
+        # Where scripts/download-model.sh keeps the GGUFs and where
+        # scripts/seed-rpc-cache.py writes `<gguf>.rpc-manifest.json` next to
+        # each. Same resolution rule as k8s_dir: the project root is the
+        # parent of configs/. Nothing is created here.
+        self.models_dir = config_path.parent.parent / "models"
         self._key_store = self.config.ssh.key_store
         self._hostnames: dict[str, str] = {}  # node_id -> SSH `hostname`
 
@@ -370,6 +392,18 @@ class Deployer:
         ``targets=None`` pushes to every enabled target (the full-deploy
         behaviour); apply_to_nodes passes the subset it is touching.
 
+        A member of a group with ``wireguard.enabled`` gets a fifth file in the
+        same connection and the same sudo chain: its ``wg0.conf``, rendered here
+        from the key store (``templating.render_wg_config``), staged 0600 like
+        node.key because it carries the node's private key inline, installed
+        root:root 0600 in a 0700 /etc/wireguard, then ``systemctl enable --now
+        wg-quick@wg0`` — and ``restart`` when ``cmp`` found the installed file
+        different, so an unchanged tunnel is never bounced. Every other node's
+        command is byte-identical to the one it ran before the tunnel existed.
+        apply never restarts a shard worker, so a change that reaches a worker's
+        tunnel (enabling it, a key rotation) still needs ``aureax stop && aureax
+        start`` for its rpc-server to come back on the new terms.
+
         Per-node failures are logged as they happen and the loop continues, the
         shape join_nodes already uses: aborting on the first one would leave the
         rest of a group unpushed AND unnamed, telling an operator about one node
@@ -409,12 +443,35 @@ class Deployer:
                 "per enabled target — before deploying."
             )
 
+        # WireGuard configs, rendered for every member of an enabled group
+        # BEFORE any node is touched — the same refuse-the-whole-push rule as
+        # the leaf check above. A missing key here means `aureax generate` has
+        # not run since the group enabled the tunnel; pushing half a star would
+        # leave a head with peers that cannot answer it.
+        wg_confs: dict[str, str] = {}
+        wg_problems: list[str] = []
+        for t in push_targets:
+            group = self.config.group_for_node(t.node_id)
+            if group is None or not group.wireguard.enabled:
+                continue
+            try:
+                wg_confs[t.node_id] = render_wg_config(t.node_id, self.config)
+            except ValueError as e:
+                wg_problems.append(str(e))
+        if wg_problems:
+            raise RuntimeError(
+                "cannot render the WireGuard config for every member of an enabled group:\n  "
+                + "\n  ".join(wg_problems)
+            )
+
         pushed: list[str] = []
         failed: list[str] = []
         for target in push_targets:
             config_path = by_node_id[target.node_id]
             leaf_cert, leaf_key = tlsstore.leaf_paths(target.node_id)
-            logger.info("Deploying config and TLS material to %s (%s)",
+            manifest = self._rpc_cache_manifest_for(target, by_node_id)
+            logger.info("Deploying config and TLS material%s to %s (%s)",
+                        " and the rpc-cache manifest" if manifest else "",
                         target.node_id, target.host)
             conn = self._conn(target, timeout=self.config.ssh.connect_timeout_seconds)
             # A fresh name per push and per file, under a 0700 directory in the
@@ -430,8 +487,76 @@ class Deployer:
             cert_stage, remote_cert = stage_path("aureax-node", ".pem")
             key_stage, remote_key = stage_path("aureax-node", ".key")
             staged = [remote_stage, remote_ca, remote_cert, remote_key]
+            # A shard worker may also get its group's rpc-cache manifest (see
+            # _rpc_cache_manifest_for). It rides the same connection and the
+            # same install chain as the four mandatory files, but it is
+            # optional: a fleet that never ran seed-rpc-cache.py pushes
+            # exactly what it pushed before.
+            uploads = [
+                (config_path, stage, 0o600, 0o700),
+                (ca_cert, ca_stage, 0o600, 0o700),
+                (leaf_cert, cert_stage, 0o600, 0o700),
+                (leaf_key, key_stage, 0o600, 0o700),
+            ]
+            manifest_install = ""
+            if manifest is not None:
+                manifest_stage, remote_manifest = stage_path("aureax-rpc-manifest", ".json")
+                staged.append(remote_manifest)
+                uploads.append((manifest, manifest_stage, 0o600, 0o700))
+                manifest_install = (
+                    f"sudo mv {remote_manifest} {NODE_RPC_CACHE_MANIFEST} && "
+                    f"sudo chown root:root {NODE_RPC_CACHE_MANIFEST} && "
+                    f"sudo chmod 0644 {NODE_RPC_CACHE_MANIFEST} && "
+                )
+            # WireGuard, for members of an enabled group only (see the
+            # docstring). Two pieces, both empty for every other node so its
+            # command stays byte-identical:
+            #
+            # * a PREFLIGHT that runs before anything is moved, so a node that
+            #   cannot run the tunnel is refused with a sentence naming the fix
+            #   instead of systemd's "unit not found", and keeps the config it
+            #   had. Braced, because `a && b || c` would run c when a failed and
+            #   blame the wrong thing.
+            # * the INSTALL, in the slot beside the manifest. `cmp` before the
+            #   mv is the "did it change" test (absent = changed); restart only
+            #   then, because a restart drops every RPC connection riding the
+            #   tunnel. `enable --now` covers first install and reboots.
+            wg_text = wg_confs.get(target.node_id)
+            wg_local_dir: Path | None = None
+            wg_preflight = ""
+            wg_install = ""
+            if wg_text is not None:
+                wg_stage, remote_wg = stage_path("aureax-wg", ".conf")
+                staged.append(remote_wg)
+                wg_preflight = (
+                    "{ command -v wg-quick >/dev/null 2>&1 || { echo 'wireguard-tools is not "
+                    "installed on this node (no wg-quick); ./scripts/setup-all.sh installs it' >&2; "
+                    "exit 1; }; } && "
+                    "{ sudo modprobe wireguard || { echo 'the wireguard kernel module is not "
+                    "available on this node (modprobe wireguard failed)' >&2; exit 1; }; } && "
+                )
+                wg_install = (
+                    f"sudo mkdir -p {NODE_WG_DIR} && "
+                    f"sudo chown root:root {NODE_WG_DIR} && "
+                    f"sudo chmod 0700 {NODE_WG_DIR} && "
+                    f"if sudo cmp -s {remote_wg} {NODE_WG_CONF}; then wg_changed=0; else wg_changed=1; fi && "
+                    f"sudo mv {remote_wg} {NODE_WG_CONF} && "
+                    f"sudo chown root:root {NODE_WG_CONF} && "
+                    f"sudo chmod 0600 {NODE_WG_CONF} && "
+                    f"sudo systemctl enable --now {NODE_WG_UNIT} && "
+                    f'{{ [ "$wg_changed" = 0 ] || sudo systemctl restart {NODE_WG_UNIT}; }} && '
+                )
 
             try:
+                if wg_text is not None:
+                    # Written to a private temporary directory, not beside the
+                    # resolved configs: the key store already holds the private
+                    # key, and a second long-lived copy on this Mac buys nothing.
+                    # Removed in the finally below whatever happens.
+                    wg_local_dir = Path(tempfile.mkdtemp(prefix="aureax-wg-"))
+                    wg_local = wg_local_dir / f"{WG_INTERFACE}.conf"
+                    write_private_file(wg_local, wg_text, mode=0o600, dir_mode=0o700)
+                    uploads.append((wg_local, wg_stage, 0o600, 0o700))
                 # mode 0600 from the moment they land, too — not only after the
                 # install below. The two certificates end up 0644 on the node,
                 # but they are staged as tightly as the key: the widening
@@ -441,16 +566,7 @@ class Deployer:
                 # One connection and one SFTP channel for all four, because an
                 # SSH handshake against an edge node's small CPU costs real
                 # time and this runs once per node per push.
-                upload_files(
-                    target.host,
-                    [
-                        (config_path, stage, 0o600, 0o700),
-                        (ca_cert, ca_stage, 0o600, 0o700),
-                        (leaf_cert, cert_stage, 0o600, 0o700),
-                        (leaf_key, key_stage, 0o600, 0o700),
-                    ],
-                    **conn,
-                )
+                upload_files(target.host, uploads, **conn)
 
                 # One remote command for the whole install, for the same
                 # reason, and because the four files are one unit — a node with
@@ -483,6 +599,7 @@ class Deployer:
                 # user, and then a local account could swap the node's key.
                 q_user = shlex.quote(target.user)
                 cmd = (
+                    f"{wg_preflight}"
                     f"sudo mkdir -p /etc/aureax {NODE_TLS_DIR} /opt/aureax/models && "
                     f"sudo chmod 0700 {NODE_TLS_DIR} && "
                     f"sudo mv {remote_stage} /etc/aureax/aureax-edge.yaml && "
@@ -495,6 +612,8 @@ class Deployer:
                     "sudo chmod 0600 /etc/aureax/aureax-edge.yaml "
                     f"{tlsstore.NODE_KEY_FILE} && "
                     f"sudo chmod 0644 {tlsstore.NODE_CA_FILE} {tlsstore.NODE_CERT_FILE} && "
+                    f"{manifest_install}"
+                    f"{wg_install}"
                     f"sudo chown {q_user}: /opt/aureax/models"
                 )
                 # The connect budget is not the command budget: sudo commonly
@@ -518,6 +637,9 @@ class Deployer:
                 with contextlib.suppress(Exception):
                     run_command(target.host, "rm -f " + " ".join(staged), **conn)
                 continue
+            finally:
+                if wg_local_dir is not None:
+                    shutil.rmtree(wg_local_dir, ignore_errors=True)
             pushed.append(target.node_id)
 
         if failed:
@@ -525,6 +647,38 @@ class Deployer:
                 f"config push failed for {', '.join(failed)} — see the log above for each "
                 f"node's error. Already updated: {', '.join(pushed) or 'none'}"
             )
+
+    def _rpc_cache_manifest_for(self, target, by_node_id: dict[str, Path]) -> Path | None:
+        """The rpc-cache manifest a shard worker should receive, if one exists.
+
+        A worker holds a share of its group HEAD's model, so the manifest is
+        looked up by the head's ``model.filename`` as written into the head's
+        generated config: ``<models_dir>/<filename>.rpc-manifest.json``, which
+        scripts/seed-rpc-cache.py writes next to the GGUF. None for a node
+        outside every group, for a head or standalone node (they hold the GGUF
+        itself), when the head's generated config is not on disk, or when no
+        manifest was ever produced — the push then carries the four mandatory
+        files and nothing else, and the worker's audit runs report-only.
+        """
+        group = next(
+            (g for g in self.config.node_groups if target.node_id in g.workers), None
+        )
+        if group is None:
+            return None
+        head_config = by_node_id.get(group.head)
+        if head_config is None or not head_config.is_file():
+            return None
+        try:
+            from client.config.parser import load_edge_config_raw
+
+            filename = ((load_edge_config_raw(head_config).get("model") or {}).get("filename") or "").strip()
+        except Exception as e:  # a config the generator wrote and we cannot read: say so, push without it
+            logger.warning("could not read %s to locate the rpc-cache manifest: %s", head_config, e)
+            return None
+        if not filename:
+            return None
+        manifest = self.models_dir / f"{filename}.rpc-manifest.json"
+        return manifest if manifest.is_file() else None
 
     def apply_to_nodes(
         self,
@@ -555,16 +709,20 @@ class Deployer:
         - the PUSH fans out to each requested node's whole group (a group
           serves one model, so member configs must stay consistent);
         - the RESTART set excludes shard workers entirely: rpc-server takes no
-          API key, and restarting a worker tears the group down and invalidates
-          its tensor cache, turning a ~107s warm head reload into a ~280s cold
-          one. `aureax start` is never a substitute for this — it does not push
-          configs (see ARCHITECTURE.md, "llama-server API-key
-          authentication").
+          API key, so a key change gives a worker nothing a restart would
+          pick up, and restarting a worker tears the whole group down for a
+          reload. The tensor cache is content-addressed and survives the
+          restart, so that reload is the ~107s warm one, not the ~280s cold one
+          — cold is a worker that never received its tensors (a fresh node, a
+          wiped cache, or a layer range that moved) — but it is still minutes
+          of outage for a change the worker cannot use. `aureax start` is never
+          a substitute for this — it does not push configs (see
+          ARCHITECTURE.md, "llama-server API-key authentication").
 
         ``wait`` is TWO passes, not one: every pod is deleted first, and only
         then are the replacements polled. A single interleaved loop holds each
         node's delete until the previous node is Ready again, which is a serial
-        fleet-wide reload — minutes of cold load per head, one after another,
+        fleet-wide reload — minutes of load per head, one after another,
         the very shape ``kubectl.delete_pods_on_node`` bans `kubectl rollout
         restart` over. The tradeoff is deliberate and worth stating plainly:
         every head reloads AT ONCE, so `--all --wait` takes the whole fleet's

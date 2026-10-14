@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
+import shutil
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -72,6 +75,37 @@ def _peer_api_key(server: dict) -> str | None:
     return value.strip()
 
 
+def _expected_rpc_proto(path: str | None = None) -> tuple[int, int] | None:
+    """(major, minor) of the RPC protocol this image's llama.cpp speaks, or None.
+
+    None when the build record is absent, unreadable or carries no
+    ``rpc_proto`` (images built before the key existed): the peer wait then
+    still requires a HELLO reply but compares nothing, so an old image is not
+    refused by a check it cannot pass. The path is resolved at call time, not
+    bound as a default, so the module constant stays the single source.
+    """
+    try:
+        data = json.loads(Path(path or _LLAMA_BUILD_JSON).read_text(encoding="utf-8"))
+        major, minor, *_rest = str(data["rpc_proto"]).split(".")
+        return int(major), int(minor)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
+    """Read exactly n bytes, or None on EOF or timeout."""
+    buf = bytearray()
+    while len(buf) < n:
+        try:
+            chunk = sock.recv(n - len(buf))
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+
 def _exit_status(rc: int | None) -> int:
     """Map a Popen return code to a process exit status.
 
@@ -96,6 +130,39 @@ _CHILD_LOG_MAX_BYTES = 100 * 1024 * 1024
 # ceiling nothing legitimate reaches — and it sits far inside the 3015s edge
 # startupProbe budget.
 _REAP_WAIT_SECONDS = 10.0
+
+# Where the deployer installs a shard worker's tensor-cache manifest: the list
+# of every tensor over rpc-server's 10 MiB cache threshold in the group's
+# model, as content hash (the cache file name) and byte size. Produced on the
+# orchestrator by scripts/seed-rpc-cache.py from the GGUF header, so a worker
+# can tell a weight it should keep from a file it should not — see
+# AureaxClient._audit_rpc_cache. Absent on a node whose model was never
+# manifested; the audit then reports and deletes nothing.
+_RPC_CACHE_MANIFEST = "/etc/aureax/rpc-cache-manifest.json"
+
+# llama.cpp's RPC handshake, as read from ggml-rpc.cpp at ba360efe / b10375
+# (RPC protocol 5.0.0; the pinned b11429 speaks 7.0.0, so heads and workers
+# must be rebuilt together, and this layout was not re-read at the new pin):
+# a connection MUST open with HELLO, command 14 — one byte
+# of command, a little-endian u64 payload size of 24, then 24 bytes of
+# connection capabilities (all zero here: no RDMA). The reply is a
+# little-endian u64 size of 28 followed by major, minor, patch, one pad byte
+# and 24 capability bytes. The server closes a connection whose first byte is
+# anything else, and llama-server refuses a peer whose major differs or whose
+# minor is newer. The head's peer wait sends exactly this exchange (see
+# AureaxClient._rpc_hello) so "the worker is listening" becomes "the worker
+# speaks our protocol version" — the difference between a 300 s timeout
+# followed by an RPC-handshake hang and a named failure in under a second.
+_RPC_CMD_HELLO = 14
+_RPC_CONN_CAPS_SIZE = 24
+_RPC_HELLO_REPLY_SIZE = 4 + _RPC_CONN_CAPS_SIZE
+
+# The image's build record, written by both Dockerfiles. {"version", "commit"}
+# on every image; images built after the engine upgrade also carry
+# "rpc_proto" ("<major>.<minor>.<patch>", read out of ggml-rpc.h at build
+# time), which is what the peer wait compares a worker's HELLO reply against.
+# Absent key = no comparison, only a log line naming what the worker said.
+_LLAMA_BUILD_JSON = "/usr/local/share/aureax-llama-build.json"
 
 # How long a shard worker waits for its own rpc-server to accept connections.
 # Ample, because rpc-server binds its listener at startup and does no loading
@@ -490,6 +557,50 @@ class AureaxClient:
                 except OSError:
                     continue
         return False
+
+    @staticmethod
+    def _rpc_hello(host: str, port: int, timeout: float = 1.0) -> tuple[str, tuple[int, int, int] | None]:
+        """Probe an rpc-server with the protocol's own HELLO.
+
+        Returns ``("closed", None)`` when nothing accepts the connection,
+        ``("silent", None)`` when something accepted it but did not answer a
+        well-formed HELLO within ``timeout`` (a pre-HELLO server, a different
+        service, or a reply of the wrong shape), and ``("ok", (major, minor,
+        patch))`` for a real rpc-server. The connection is closed afterwards;
+        the server serves one client at a time with a listen backlog of 1, so
+        the probe must never linger — and it is only ever sent BEFORE this
+        head's llama-server attaches, never while it is connected
+        (ARCHITECTURE.md, "Invariants and how each is enforced": a worker's
+        :50052 is never dialled from off-node).
+        """
+        target = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+        try:
+            infos = socket.getaddrinfo(target, port, type=socket.SOCK_STREAM)
+        except OSError:
+            return "closed", None
+        request = bytes([_RPC_CMD_HELLO]) + struct.pack("<Q", _RPC_CONN_CAPS_SIZE) + bytes(_RPC_CONN_CAPS_SIZE)
+        for family, socktype, proto, _canon, sockaddr in infos:
+            with socket.socket(family, socktype, proto) as s:
+                s.settimeout(timeout)
+                try:
+                    s.connect(sockaddr)
+                except OSError:
+                    continue
+                try:
+                    s.sendall(request)
+                    size_raw = _recv_exact(s, 8)
+                    if size_raw is None:
+                        return "silent", None
+                    (size,) = struct.unpack("<Q", size_raw)
+                    if size != _RPC_HELLO_REPLY_SIZE:
+                        return "silent", None
+                    reply = _recv_exact(s, size)
+                    if reply is None:
+                        return "silent", None
+                    return "ok", (reply[0], reply[1], reply[2])
+                except OSError:
+                    return "silent", None
+        return "closed", None
 
     def _llama_port_in_use(self) -> bool:
         """Probe the local port; True if something is already listening."""
@@ -905,6 +1016,12 @@ class AureaxClient:
         # shipper exists for.
         self._start_log_shipping()
 
+        # After the shipper and before rpc-server opens the cache: the audit's
+        # warnings are the only record of what it deleted, and a cache that
+        # rpc-server is already serving from must not be edited underneath it.
+        if rpc_cfg.get("cache", True):
+            self._audit_rpc_cache(cache_dir, float(rpc_cfg.get("min_free_disk_gib") or 0))
+
         self._spawn_child("rpc-server", [binary, *get_rpc_server_args(self.config)], log_path)
         # Probe the address rpc-server actually bound, not loopback: with
         # host "auto" it binds this node's LAN IP only, so a 127.0.0.1 check
@@ -935,6 +1052,127 @@ class AureaxClient:
             # the ONLY way the run-up to its death reaches the orchestrator.
             self._exit_reporting(_exit_status(rc), rc)
         sys.exit(_exit_status(rc))
+
+    def _audit_rpc_cache(self, cache_dir: str, min_free_gib: float) -> None:
+        """Check the worker's tensor cache before rpc-server opens it.
+
+        rpc-server's cache (``<cache_dir>/rpc/<fnv1a64>``) is content-addressed
+        and written in place: a file is named by the hash of the bytes it
+        holds, nothing ever deletes one, and on a hit the server trusts the
+        file's size without re-hashing. Two things follow, both read from
+        ggml-rpc.cpp at b10375 rather than observed here:
+
+        - A pod killed mid-write leaves a TRUNCATED weight that the next load
+          accepts silently, as a partial tensor. The manifest's byte size is
+          what catches it. (Not re-checked at the current pin, b11429.)
+        - At b10375 every tensor over 10 MiB that the head sent was cached,
+          not only weights: a prefill attention mask passes that threshold
+          once the prompt is ~10k tokens deep, so one long prompt wrote
+          gigabytes of mask files that were never read back and never
+          removed. Upstream restricted the cache to weights in b10985, so the
+          pinned build (b11429) no longer writes them; this half of the audit
+          is now the backstop that clears what an older image left behind.
+
+        With a manifest that carries hashes, every file is classified by name
+        and size; with a sizes-only manifest, by size; without one, nothing is
+        deleted and the audit only reports. Dotfiles are the seeder's partial
+        exports and are always removed. Then the free-space floor: a full
+        hostPath takes the kubelet down with it, so a worker below the floor
+        does not start.
+        """
+        cache_root = Path(cache_dir)
+        if not cache_root.is_dir():
+            logger.debug("rpc-cache audit skipped: %s does not exist", cache_dir)
+            return
+        rpc_dir = cache_root / "rpc"
+
+        manifest = self._load_rpc_cache_manifest()
+        entries = (manifest or {}).get("entries") or []
+        by_hash: dict[str, int] = {}
+        sizes: set[int] = set()
+        for entry in entries:
+            try:
+                nbytes = int(entry["nbytes"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            sizes.add(nbytes)
+            if entry.get("hash"):
+                by_hash[str(entry["hash"])] = nbytes
+
+        kept = kept_bytes = 0
+        removed: dict[str, list[str]] = {"unknown": [], "mismatched": [], "partial": []}
+        if rpc_dir.is_dir():
+            for path in sorted(rpc_dir.iterdir()):
+                if not path.is_file():
+                    continue
+                size = path.stat().st_size
+                if path.name.startswith("."):
+                    verdict = "partial"
+                elif manifest is None:
+                    verdict = "keep"
+                elif path.name in by_hash:
+                    verdict = "keep" if size == by_hash[path.name] else "mismatched"
+                elif by_hash:
+                    verdict = "unknown"
+                else:
+                    verdict = "keep" if size in sizes else "unknown"
+
+                if verdict == "keep":
+                    kept += 1
+                    kept_bytes += size
+                    continue
+                try:
+                    path.unlink()
+                    removed[verdict].append(f"{path.name} ({size} B)")
+                except OSError as e:
+                    logger.warning("rpc-cache audit: could not remove %s: %s", path, e)
+
+        source = "no manifest, report only" if manifest is None else (
+            f"manifest with {len(by_hash)} hashed of {len(entries)} entries"
+            if by_hash else f"sizes-only manifest, {len(entries)} entries"
+        )
+        logger.info(
+            "rpc-cache audit: kept %d file(s), %.2f GiB in %s (%s)",
+            kept, kept_bytes / 2**30, rpc_dir, source,
+        )
+        for kind, names in removed.items():
+            if names:
+                logger.warning(
+                    "rpc-cache audit: removed %d %s file(s) from %s: %s",
+                    len(names), kind, rpc_dir, ", ".join(names[:8]) + (" ..." if len(names) > 8 else ""),
+                )
+
+        if min_free_gib > 0:
+            free = shutil.disk_usage(cache_root).free
+            if free < min_free_gib * 2**30:
+                logger.error(
+                    "refusing to start rpc-server: %.2f GiB free on %s, below "
+                    "model.rpc_server.min_free_disk_gib = %.1f. A full cache filesystem "
+                    "takes the node down; free space there (the audit above removed what "
+                    "it could identify) or lower the floor in this node's config.",
+                    free / 2**30, cache_dir, min_free_gib,
+                )
+                self._exit_reporting(1)
+
+    def _load_rpc_cache_manifest(self) -> dict | None:
+        """The deployer-installed manifest, or None when absent or unreadable.
+
+        Unreadable is treated like absent, loudly: a manifest that cannot be
+        parsed must not turn into "delete everything" or "delete nothing"
+        silently — it becomes report-only with a warning naming the file.
+        """
+        path = Path(_RPC_CACHE_MANIFEST)
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            logger.warning("rpc-cache manifest %s is unreadable (%s); auditing report-only", path, e)
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+            logger.warning("rpc-cache manifest %s has no entries list; auditing report-only", path)
+            return None
+        return data
 
     def _block_on_child(self) -> None:
         """Supervise the inference child until it exits, then propagate its code.
@@ -1019,16 +1257,42 @@ class AureaxClient:
         for p in peers:
             host, _, port_s = p.rpartition(":")
             pending.append((p, host, port_s))
+        expected = _expected_rpc_proto()
+        silent_warned: set[str] = set()
         last_progress = 0.0
         while pending and time.time() - start < timeout:
             if self._shutdown:
                 return
             still: list[tuple[str, str, str]] = []
             for peer, host, port_s in pending:
-                if self._port_in_use(host, int(port_s), timeout=1.0):
-                    logger.info("  worker %s is up", peer)
-                else:
-                    still.append((peer, host, port_s))
+                state, version = self._rpc_hello(host, int(port_s), timeout=1.0)
+                if state == "ok":
+                    major, minor, patch = version
+                    if expected is not None and (major, minor) != expected:
+                        # Fail NOW, by name. Left alone, llama-server would
+                        # connect, reject the handshake and exit — or, against
+                        # a pre-HELLO server, hang in it — and the only
+                        # record would be the startupProbe giving up later.
+                        logger.error(
+                            "RPC worker %s speaks RPC protocol %d.%d.%d but this image expects "
+                            "%d.%d — the group is running two llama.cpp builds. Rebuild the "
+                            "odd one out with ./scripts/build-on-node.sh <host> (or the whole "
+                            "fleet with ./scripts/update-all.sh), then `aureax stop && aureax "
+                            "start`: apply never restarts workers.",
+                            peer, major, minor, patch, expected[0], expected[1],
+                        )
+                        self._exit_reporting(1)
+                    logger.info("  worker %s is up (RPC protocol %d.%d.%d)", peer, major, minor, patch)
+                    continue
+                if state == "silent" and peer not in silent_warned:
+                    silent_warned.add(peer)
+                    logger.warning(
+                        "  worker %s accepts TCP but did not answer the RPC HELLO within 1s — "
+                        "an rpc-server from a build that predates HELLO, something else on the "
+                        "port, or a server still coming up; waiting",
+                        peer,
+                    )
+                still.append((peer, host, port_s))
             pending = still
             if not pending:
                 break
@@ -1072,7 +1336,7 @@ class AureaxClient:
         url = f"{self._llama_url()}/health"
         attached = getattr(self, "_child_proc", None) is None
 
-        # /health is auth-exempt on the pinned build (b10375), so the header is
+        # /health is auth-exempt on the pinned build (b11429), so the header is
         # belt-and-braces: upstream removing an exemption is a known upgrade
         # landmine (see ARCHITECTURE.md, "llama-server API-key
         # authentication"), and a build that gates /health would otherwise make
@@ -1205,8 +1469,9 @@ class AureaxClient:
         file this node ACTUALLY has. A hand-edited or half-written
         /etc/aureax/aureax-edge.yaml is exactly that case.
 
-        Only the structural check runs here. On the pinned build (b10375)
-        /props carries no device list and no flash-attention field, and
+        Only the structural check runs here. At b10375 (verified live; not
+        re-checked at the current pin, b11429) /props carries no device list
+        and no flash-attention field, and
         llama-server.log at the default verbosity prints neither — so a runtime
         device-count or flash-attention check would have nothing to read, and a
         guessed JSON key or log pattern would be inert while looking enforced.
@@ -1221,16 +1486,19 @@ class AureaxClient:
             # --rpc (client/config/parser.py), so there is nothing to compare.
             return
         split = list(server_cfg.get("tensor_split") or [])
-        if not split or len(split) == len(peers):
+        # One RPC device per peer unless the generator stamped the real count
+        # (a worker exposing two GPUs is two devices behind one address).
+        expected = int(server_cfg.get("rpc_device_count") or len(peers))
+        if not split or len(split) == expected:
             # An empty split is llama.cpp's own free-memory split, which is a
             # documented configuration, not a mismatch.
             return
 
         logger.error(
-            "model.server.tensor_split has %d entries but model.server.rpc_servers names "
-            "%d peer(s) — this node's /etc/aureax/aureax-edge.yaml does not match what "
+            "model.server.tensor_split has %d entries but the group's %d peer(s) expose "
+            "%d RPC device(s) — this node's /etc/aureax/aureax-edge.yaml does not match what "
             "`aureax generate` produces. Re-run `aureax apply --node %s`.",
-            len(split), len(peers), self.node_id,
+            len(split), len(peers), expected, self.node_id,
         )
         self._exit_reporting(1)
 

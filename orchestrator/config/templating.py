@@ -16,6 +16,7 @@ from pathlib import Path
 from pydantic import ValidationError
 from ruamel.yaml import YAML
 
+from orchestrator.config import placement
 from orchestrator.config.atomic import write_private_file
 from orchestrator.config.cache import (
     load_edge_config_cached,
@@ -32,6 +33,7 @@ from orchestrator.config.schema import (
     HEAD_ROLE,
     MCP_NODE_PORT,
     SHARD_WORKER_ROLE,
+    WG_INTERFACE,
     NetworkConfig,
     SSHTarget,
     mcp_client_enabled,
@@ -53,6 +55,13 @@ _PLACEHOLDER_RE = re.compile(r"\$\{([^}]*)\}")
 # compare raw template text against them.
 _WORKER_WAIT_PLACEHOLDER = "${worker_wait_timeout_seconds}"
 _RPC_SERVERS_PLACEHOLDER = "${rpc_servers}"
+# The two launch values llama.cpp's placement rule turns into a layer layout
+# (orchestrator/config/placement.py). A head template may carry literals — the
+# frozen rollback pair does — or these placeholders, which resolve per group
+# from node_groups.head_layers / .placement. Any head-resident layers REQUIRE
+# the placeholders: a literal split cannot follow a changed layer range.
+_TENSOR_SPLIT_PLACEHOLDER = "${tensor_split}"
+_GPU_LAYERS_PLACEHOLDER = "${gpu_layers}"
 _MCP_ENDPOINTS_PLACEHOLDER = "${mcp_endpoints}"
 _MCP_API_KEY_PLACEHOLDER = "${mcp_api_key}"
 
@@ -144,6 +153,11 @@ PLACEHOLDER_DUMMIES: dict[str, object] = {
     "orchestrator_url": "https://127.0.0.1:7001",
     "group_id": "",
     "rpc_servers": [],
+    # Shaped like a resolved placement: an even split over one device and
+    # llama.cpp's offload-everything value. The real build_variables computes
+    # both per group (orchestrator/config/placement.py).
+    "tensor_split": [1],
+    "gpu_layers": 99,
     # int, not "": NodeConfig types this field, so a string stand-in would make
     # the dashboard reject a head template that deploys perfectly well.
     "worker_wait_timeout_seconds": DEFAULT_WORKER_WAIT_SECONDS,
@@ -385,9 +399,17 @@ def build_variables(
     group = network_config.group_for_node(target.node_id)
 
     rpc_servers: list[str] = []
+    placement_values: dict[str, object] = {"tensor_split": [], "gpu_layers": placement.GPU_LAYERS_ALL}
     if group is not None and target.node_id == group.head:
-        # Only the head dials out; workers listen and are dialled.
-        rpc_servers = group.rpc_endpoints(network_config.host_by_node_id())
+        # Only the head dials out; workers listen and are dialled. Over the
+        # group's WireGuard tunnel when it has one: each worker's rpc-server
+        # binds its tunnel address only, so its LAN address would be refused.
+        wg_addresses = network_config.wireguard_addresses(group)
+        rpc_servers = group.rpc_endpoints(
+            wg_addresses if wg_addresses is not None else network_config.host_by_node_id()
+        )
+        placed = group_placement(group, network_config, configs_dir)
+        placement_values = {"tensor_split": placed.tensor_split, "gpu_layers": placed.gpu_layers}
 
     return {
         "node_id": target.node_id,
@@ -406,6 +428,11 @@ def build_variables(
         ),
         "group_id": group.name if group else "",
         "rpc_servers": rpc_servers,
+        # The head's layer layout, as llama.cpp's own launch values. Every
+        # non-head gets an empty split and the offload-everything count, which
+        # is inert: client/config/parser.py emits --tensor-split only beside
+        # --rpc, and a standalone node's gpu_layers literal is what it wrote.
+        **placement_values,
         # The head reads this from its own `node:` block; the group is where it
         # is configured. Without this hop the setting is a silent no-op and the
         # head always uses the client's hardcoded default.
@@ -427,6 +454,218 @@ def build_variables(
         # serving both would make a leaked llama key an MCP key too.
         "mcp_api_key": mcp_api_key,
     }
+
+
+def group_device_count(group, network_config: NetworkConfig, configs_dir: Path | None) -> int:
+    """How many RPC devices the group's workers expose in total.
+
+    One per worker unless its template's ``model.rpc_server.devices`` names
+    several: each exposed device is one RPC device on the head, numbered in
+    ``--rpc`` order, and it is this count — not the worker count — that a
+    ``tensor_split`` must match. A template that cannot be read counts as one
+    device; validate_groups reports the unreadable file itself.
+    """
+    by_id = {t.node_id: t for t in network_config.ssh.targets}
+    total = 0
+    for worker in group.workers:
+        count = 1
+        wtarget = by_id.get(worker)
+        if configs_dir is not None and wtarget is not None and wtarget.config_file:
+            try:
+                wcfg = load_edge_config_cached(configs_dir / wtarget.config_file)
+                devices = ((wcfg.get("model") or {}).get("rpc_server") or {}).get("devices") or []
+                if isinstance(devices, list) and devices:
+                    count = len(devices)
+            except Exception:
+                count = 1
+        total += count
+    return total
+
+
+def group_placement(group, network_config: NetworkConfig, configs_dir: Path | None):
+    """The layer layout for one group: ``gpu_layers`` and an integer ``tensor_split``.
+
+    Reads what the policy needs and no more. ``head_layers 0`` with the
+    ``even`` policy needs nothing and yields ``[1, ...]`` with 99 — today's
+    command line exactly. Head-resident layers need the layer count, taken
+    from the GGUF header when the file is in ``<project>/models/`` and from
+    the registry entry's ``layers`` hint otherwise; ``balanced`` needs the
+    file. Context size, slots and KV cache type come from the head template
+    because KV lives on the device that owns the layer and counts toward its
+    footprint. Raises ``ValueError`` naming the missing input.
+    """
+    n_devices = group_device_count(group, network_config, configs_dir)
+    if group.head_layers == 0 and group.placement == "even":
+        return placement.plan(n_devices=n_devices)
+
+    by_id = {t.node_id: t for t in network_config.ssh.targets}
+    head = by_id.get(group.head)
+    head_cfg: dict = {}
+    if configs_dir is not None and head is not None and head.config_file:
+        try:
+            head_cfg = load_edge_config_cached(configs_dir / head.config_file) or {}
+        except Exception:
+            head_cfg = {}
+    model = head_cfg.get("model") or {}
+    server = model.get("server") or {}
+    filename = str(model.get("filename") or "").strip()
+
+    profile = None
+    n_layer = None
+    source = "none"
+    gguf_path = (configs_dir.parent / "models" / filename) if (configs_dir is not None and filename) else None
+    if gguf_path is not None and gguf_path.is_file():
+        profile = placement.profile_from_gguf(
+            gguf_path,
+            cache_type_k=str(server.get("cache_type_k") or "f16"),
+            cache_type_v=str(server.get("cache_type_v") or "f16"),
+        )
+    else:
+        entry = next((m for m in network_config.model_registry.models if m.filename == filename), None)
+        if entry is not None and entry.layers:
+            n_layer, source = int(entry.layers), "registry"
+
+    def _int(value, default):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    try:
+        return placement.plan(
+            n_devices=n_devices, head_layers=group.head_layers, policy=group.placement,
+            profile=profile, n_layer=n_layer, source=source,
+            ctx_tokens=_int(server.get("context_size"), 4096),
+            n_seq=_int(server.get("parallel_slots"), 1),
+        )
+    except ValueError as e:
+        raise ValueError(
+            f"group {group.name!r}: cannot place head_layers={group.head_layers} "
+            f"({group.placement}) over {n_devices} RPC device(s): {e}"
+        ) from e
+
+
+def wireguard_node_block(node_id: str, network_config: NetworkConfig) -> dict | None:
+    """The ``node.wireguard`` block for ``node_id``, or None outside an enabled group.
+
+    ``address`` carries the prefix length, exactly as wg-quick's ``Address=``
+    does, so the node can bind it and the deployer can render it from one value.
+    """
+    group = network_config.group_for_node(node_id)
+    if group is None:
+        return None
+    addresses = network_config.wireguard_addresses(group)
+    if addresses is None:
+        return None
+    net = network_config.wireguard_network(group)
+    return {"interface": WG_INTERFACE, "address": f"{addresses[node_id]}/{net.prefixlen}"}
+
+
+def _stamp_wireguard(node_block: dict, target: SSHTarget, network_config: NetworkConfig) -> None:
+    """Assign or remove ``node.wireguard`` in a resolved config, in place."""
+    stamped = wireguard_node_block(target.node_id, network_config)
+    if stamped is None:
+        if "wireguard" in node_block:
+            logger.warning(
+                "%s carries a node.wireguard block but %s is not in a group with "
+                "wireguard.enabled — removing it, or rpc-server would bind an address this "
+                "node does not have. Remove the block from the template.",
+                target.config_file, target.node_id,
+            )
+            del node_block["wireguard"]
+        return
+    if "wireguard" in node_block and node_block["wireguard"] != stamped:
+        logger.warning(
+            "%s carries its own node.wireguard block (%r) — overriding it with %r, which is "
+            "what the group's tunnel actually assigns. Remove the block from the template.",
+            target.config_file, node_block["wireguard"], stamped,
+        )
+    node_block["wireguard"] = stamped
+
+
+def _wg_endpoint(host: str, node_id: str, port: int) -> str:
+    """``host:port`` for a worker's Endpoint= line, as an IP literal.
+
+    Resolved on the orchestrator, like the firewall allowlist: wg-quick on the
+    node would otherwise need a resolver that answers for the head's name at
+    every boot, and a name it cannot resolve leaves the tunnel up with no peer
+    address. IPv4 first when the name has both, because the tunnel's own
+    addresses are IPv4 and the underlay rarely differs; an IPv6 literal is
+    bracketed, as wg-quick requires.
+    """
+    literals = resolve_host_literals(host, node_id)
+    chosen = next((a for a in literals if ipaddress.ip_address(a).version == 4), literals[0])
+    if ipaddress.ip_address(chosen).version == 6:
+        chosen = f"[{chosen}]"
+    return f"{chosen}:{port}"
+
+
+def render_wg_config(node_id: str, network_config: NetworkConfig) -> str:
+    """The node's ``/etc/wireguard/wg0.conf``, private key inline.
+
+    A star: on the HEAD one ``[Peer]`` per worker with that worker's /32 and no
+    Endpoint (workers initiate, and the head learns each address from the
+    worker's authenticated packets); on a WORKER one ``[Peer]`` for the head,
+    with the head's physical address as Endpoint and a keepalive so the head
+    can always reach it. Workers never peer with each other — all RPC traffic
+    is head<->worker, the head relays.
+
+    Reads keys, never mints them: ``aureax generate`` mints every member's pair
+    and this raises ValueError naming that command when one is missing.
+    Deterministic — no timestamp — because the deployer restarts wg-quick only
+    when the installed file differs from this text.
+    """
+    from orchestrator.config import wgstore
+
+    group = network_config.group_for_node(node_id)
+    addresses = network_config.wireguard_addresses(group) if group is not None else None
+    if group is None or addresses is None:
+        raise ValueError(f"{node_id} is not a member of a node group with wireguard.enabled")
+    net = network_config.wireguard_network(group)
+    wg = group.wireguard
+
+    def key_of(member: str, private: bool = False) -> str:
+        value = wgstore.private_key(member) if private else wgstore.public_key(member)
+        if value is None:
+            raise ValueError(
+                f"{member} has no WireGuard key in {wgstore.store_dir()} — run "
+                "`aureax generate --orchestrator-ip <ip>`, which mints one for every member of "
+                f"group {group.name!r}"
+            )
+        return value
+
+    role = "head" if node_id == group.head else "worker"
+    lines = [
+        f"# {WG_INTERFACE}.conf for {node_id} ({role} of group {group.name}).",
+        "# Written by `aureax apply`; edits are overwritten. Carries rpc-server's traffic;",
+        '# see ARCHITECTURE.md, "WireGuard transport for rpc-server".',
+        "[Interface]",
+        f"PrivateKey = {key_of(node_id, private=True)}",
+        f"Address = {addresses[node_id]}/{net.prefixlen}",
+        f"ListenPort = {wg.listen_port}",
+        f"MTU = {wg.mtu}",
+    ]
+    if node_id == group.head:
+        for worker in group.workers:
+            lines += [
+                "",
+                "[Peer]",
+                f"# {worker} (worker)",
+                f"PublicKey = {key_of(worker)}",
+                f"AllowedIPs = {addresses[worker]}/32",
+            ]
+    else:
+        head_host = network_config.host_by_node_id()[group.head]
+        lines += [
+            "",
+            "[Peer]",
+            f"# {group.head} (head)",
+            f"PublicKey = {key_of(group.head)}",
+            f"AllowedIPs = {addresses[group.head]}/32",
+            f"Endpoint = {_wg_endpoint(head_host, group.head, wg.listen_port)}",
+            f"PersistentKeepalive = {wg.persistent_keepalive}",
+        ]
+    return "\n".join(lines) + "\n"
 
 
 def generate_edge_config(
@@ -541,6 +780,15 @@ def generate_edge_config(
             )
         resolved["tls"] = stamped
 
+    # The WireGuard block, stamped for the same reasons as tls: — never written
+    # by hand, never forgettable. Present exactly on members of a group with
+    # `wireguard.enabled`, removed from everything else, so a template carrying
+    # a stale block cannot point rpc-server at an address the node does not
+    # have. A fleet that never enables the tunnel carries no such block anywhere
+    # and this changes nothing in its configs.
+    if isinstance(resolved, dict) and isinstance(resolved.get("node"), dict):
+        _stamp_wireguard(resolved["node"], target, network_config)
+
     # The RESOLVED config is what the node actually runs, and nothing between
     # here and the node validates it: it is dumped to disk, SSH-pushed to
     # /etc/aureax/aureax-edge.yaml and read by the client with no Pydantic at
@@ -573,9 +821,23 @@ def generate_edge_config(
         group = network_config.group_for_node(target.node_id)
         if group is None:
             raise ValueError(f"Worker {target.node_id} has no group head for its RPC firewall")
-        head = network_config.host_by_node_id()[group.head]
-        resolved.setdefault("model", {}).setdefault("rpc_server", {})["allowed_clients"] = (
-            resolve_host_literals(head, group.head)
+        wg_addresses = network_config.wireguard_addresses(group)
+        if wg_addresses is not None:
+            # The head's TUNNEL address and nothing else. Its LAN address must
+            # not stay here: the point of the tunnel is that the only way to
+            # rpc-server is a packet WireGuard authenticated against the head's
+            # key, and an allowlisted LAN address would be a second way.
+            allowed = [wg_addresses[group.head]]
+        else:
+            head = network_config.host_by_node_id()[group.head]
+            allowed = resolve_host_literals(head, group.head)
+        resolved.setdefault("model", {}).setdefault("rpc_server", {})["allowed_clients"] = allowed
+    group = network_config.group_for_node(target.node_id)
+    if group is not None and group.head == target.node_id:
+        # The head's own topology check compares its split against this, not
+        # against the peer count: a worker exposing two devices is two slots.
+        resolved.setdefault("model", {}).setdefault("server", {})["rpc_device_count"] = (
+            group_device_count(group, network_config, configs_dir)
         )
 
     # Stamp deployment metadata. The hash is over
@@ -634,6 +896,8 @@ def validate_groups(network_config: NetworkConfig, configs_dir: Path) -> list[st
       tests/test_probe_budget.py, daemonset-edge.yaml's startupProbe budget and
       `aureax status` all keep quoting the group number the node never uses.
     - Every worker must bind the port the head dials.
+    - In a group with `wireguard.enabled`, every worker's rpc_server.host must
+      be `auto`, the only value that binds the stamped tunnel address.
     - tensor_split, if given, must have one entry per participating device.
 
     Returns a list of human-readable problems; empty means valid.
@@ -711,21 +975,25 @@ def validate_groups(network_config: NetworkConfig, configs_dir: Path) -> list[st
             # whole fleet's generate with a ValueError instead of reporting one
             # file. Same rule as the worker port below.
             raw_ngl = head_server.get("gpu_layers", 0) or 0
-            try:
-                gpu_layers = int(raw_ngl)
-            except (TypeError, ValueError):
-                problems.append(
-                    f"group {group.name!r}: head {group.head!r} has "
-                    f"gpu_layers: {raw_ngl!r} — expected a number"
-                )
+            ngl_is_placeholder = isinstance(raw_ngl, str) and _GPU_LAYERS_PLACEHOLDER in raw_ngl
+            if ngl_is_placeholder:
+                pass  # resolved per group by build_variables from node_groups.head_layers
             else:
-                if gpu_layers <= 0:
+                try:
+                    gpu_layers = int(raw_ngl)
+                except (TypeError, ValueError):
                     problems.append(
                         f"group {group.name!r}: head {group.head!r} has "
-                        f"gpu_layers: {raw_ngl!r} — RPC devices are "
-                        "GPU-class devices, so every layer would stay on the head's CPU "
-                        "while the workers idle. Set gpu_layers: 99."
+                        f"gpu_layers: {raw_ngl!r} — expected a number or `${{gpu_layers}}`"
                     )
+                else:
+                    if gpu_layers <= 0:
+                        problems.append(
+                            f"group {group.name!r}: head {group.head!r} has "
+                            f"gpu_layers: {raw_ngl!r} — RPC devices are "
+                            "GPU-class devices, so every layer would stay on the head's CPU "
+                            "while the workers idle. Set gpu_layers: 99."
+                        )
 
             # The head is the only member that dials out, and it dials what this
             # key resolves to. A template that has lost it generates a head with
@@ -780,24 +1048,39 @@ def validate_groups(network_config: NetworkConfig, configs_dir: Path) -> list[st
                     )
 
             split = head_server.get("tensor_split") or []
-            if split and not isinstance(split, list):
+            split_is_placeholder = isinstance(split, str) and _TENSOR_SPLIT_PLACEHOLDER in split
+            expected = group_device_count(group, network_config, configs_dir)
+            if split_is_placeholder:
+                pass  # resolved per group by build_variables; its length is the device count
+            elif split and not isinstance(split, list):
                 # Reported rather than skipped: skipping would drop the length
                 # check below, which is the whole point of this validator.
                 problems.append(
                     f"group {group.name!r}: head {group.head!r} has "
                     f"model.server.tensor_split {split!r} — expected a list with one "
-                    "entry per worker"
+                    "entry per RPC device, or `${tensor_split}`"
                 )
-            elif split:
-                # One entry per RPC device, i.e. per worker. The head never
-                # takes a share — include_head_as_worker is rejected by the
-                # schema validator, which explains why.
-                expected = len(group.workers)
-                if len(split) != expected:
-                    problems.append(
-                        f"group {group.name!r}: tensor_split has {len(split)} entries but "
-                        f"{expected} device(s) participate"
-                    )
+            elif split and len(split) != expected:
+                # One entry per RPC device: one per worker unless a worker's
+                # rpc_server.devices exposes several. The head takes no device
+                # slot even when it keeps layers — head-resident layers are what
+                # gpu_layers leaves on the CPU, not a device in the split.
+                problems.append(
+                    f"group {group.name!r}: tensor_split has {len(split)} entries but "
+                    f"{expected} device(s) participate"
+                )
+            # Head-resident layers (or a balanced split) move the layout with
+            # the group's settings; a literal in the template cannot follow and
+            # would silently place the layers the old way.
+            if (group.head_layers > 0 or group.placement != "even") and not (
+                split_is_placeholder and ngl_is_placeholder
+            ):
+                problems.append(
+                    f"group {group.name!r}: head_layers {group.head_layers} / placement "
+                    f"{group.placement!r} need the head template to carry "
+                    "`tensor_split: ${tensor_split}` and `gpu_layers: ${gpu_layers}` so the "
+                    "layout follows the group; a literal would place the layers the old way"
+                )
 
         for worker in group.workers:
             wcfg = node_cfg(worker)
@@ -872,6 +1155,20 @@ def validate_groups(network_config: NetworkConfig, configs_dir: Path) -> list[st
                         f"model.rpc_server.port {worker_port} but the head dials "
                         f"rpc_port {group.rpc_port} — the head would wait out its peer "
                         "timeout on a port nothing is listening on"
+                    )
+
+            # With the tunnel on, `host: auto` is what binds rpc-server to the
+            # stamped tunnel address (client/config/parser.py::resolve_rpc_host).
+            # A literal host overrides that and either binds the LAN address the
+            # head no longer dials, or one the node does not have.
+            if group.wireguard.enabled:
+                raw_host = rpc_block.get("host")
+                if raw_host is not None and raw_host != "auto":
+                    problems.append(
+                        f"group {group.name!r}: worker {worker!r} sets "
+                        f"model.rpc_server.host: {raw_host!r}, but the group has "
+                        "wireguard.enabled — rpc-server must bind its tunnel address, which "
+                        "only `host: auto` resolves to. Remove the line or set it to auto."
                     )
 
     return problems
@@ -1015,6 +1312,21 @@ def generate_all_edge_configs(
             configs_dir / target.config_file
         ):
             keystore.ensure_key(target.node_id, kind=keystore.KIND_MCP)
+
+    # WireGuard pairs, in the same "before any target is resolved" slot and for
+    # the same kind of reason: a node's wg0.conf carries its PEERS' public keys
+    # (every worker's on the head, the head's on each worker), so a member
+    # rendered before its peers were minted would ship a tunnel with a missing
+    # peer. Only members of a group with wireguard.enabled get a pair — a fleet
+    # that never enables the tunnel never grows ~/.aureax/wireguard at all.
+    # ensure_key never replaces an existing key; `aureax wg regenerate` does.
+    if any(g.wireguard.enabled for g in network_config.node_groups):
+        from orchestrator.config import wgstore
+
+        for group in network_config.node_groups:
+            if group.wireguard.enabled:
+                for node_id in group.members:
+                    wgstore.ensure_key(node_id)
 
     # TLS material, for the same "before any config is written" reason: the
     # deployer refuses to push a node whose leaf is missing, and a generate that

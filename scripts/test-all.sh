@@ -349,7 +349,7 @@ skip_shard_checks() {
 
 skip_auth_checks() {
     skip "/health public"
-    skip "/v1/models public"
+    skip "/v1/models unauthenticated rejected"
     skip "/props unauthenticated rejected"
     skip "/props with key accepted"
     skip "/metrics with key accepted"
@@ -392,6 +392,16 @@ ssh_facts_at() {
         return 1
     fi
     ssh_facts "${NODE_HOSTS[$i]}" "${NODE_USERS[$i]}" "${NODE_KEY_FILES[$i]}" "$@"
+}
+
+# The image architecture and the recorded llama.cpp commit out of a SUM_CMD
+# blob (section 6). Each fact sits on its own tagged line, so neither depends
+# on the order the three facts arrive in; empty when the fact is absent.
+image_arch_of() {
+    printf '%s\n' "$1" | sed -n 's/^.*image_arch=\([A-Za-z0-9_]*\).*$/\1/p' | head -1
+}
+llama_commit_of() {
+    printf '%s\n' "$1" | sed -n 's/.*"commit" *: *"\([0-9a-f]\{7,64\}\)".*/\1/p' | head -1
 }
 
 # The 64-hex digest from a `sha256sum` line, or empty when the line is
@@ -1174,7 +1184,17 @@ else
     # image is genuinely absent it reaches for docker.io instead of failing
     # fast, and an unbounded probe against a wedged daemon sits far past the
     # point where a build-consistency check has any answer to give.
-    SUM_CMD="timeout 20 sudo -n docker run --rm --pull=never --entrypoint sha256sum aureax-client:dev /usr/local/bin/rpc-server 2>&1 | tail -1"
+    # One container start per member, three facts: the rpc-server checksum,
+    # the image's machine architecture and the llama.cpp commit the image was
+    # built from (docker/Dockerfile.client writes it into llama-build.json).
+    # The commit is what the RPC wire format is locked to and it is
+    # architecture-neutral, so it is compared across EVERY member; the
+    # checksum can only match within one architecture (a CUDA x86_64 member
+    # built from the head's commit is a different binary by construction), so
+    # it is compared only among members that share the head's architecture.
+    # orchestrator/cluster/buildcheck.py applies the same two rules for
+    # `aureax start` and `group doctor`; this section is the shell-side echo.
+    SUM_CMD="timeout 20 sudo -n docker run --rm --pull=never --entrypoint sh aureax-client:dev -c 'sha256sum /usr/local/bin/rpc-server; echo image_arch=\$(uname -m); cat /usr/local/share/aureax-llama-build.json 2>/dev/null' 2>&1"
 
     for gi in $(seq 0 $((GROUP_COUNT - 1))); do
         GNAME="${GROUP_NAMES[$gi]}"
@@ -1204,6 +1224,8 @@ else
         W_LISTENING=()
         W_RSS=()
         W_SUM=()
+        W_ARCH=()
+        W_COMMIT=()
         for w in "${GWORKERS[@]}"; do
             FACTS=$(ssh_facts_at "$(node_index_of "$w")" \
                 "LISTENING={ ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null; } | grep -c ':${GPORT}'" \
@@ -1229,11 +1251,16 @@ else
             # the remote's own error text still reaches the skip line below.
             LISTENING=$(sed -n 's/^LISTENING=//p' <<<"$FACTS" | tr -cd '0-9')
             RSS=$(sed -n 's/^RSS=//p' <<<"$FACTS" | tr -cd '0-9')
+            # SUM_CMD prints three lines; ssh_facts prefixes only the first
+            # with "SUM=", so the checksum is the SUM line and the other two
+            # facts are found by their own tags anywhere in the blob.
             SUM=$(sed -n 's/^SUM=\([0-9a-f]\{64\}\).*/\1/p' <<<"$FACTS")
             [ -n "$SUM" ] || SUM=$(sed -n 's/^SUM=//p' <<<"$FACTS")
             W_LISTENING+=("$LISTENING")
             W_RSS+=("$RSS")
             W_SUM+=("$SUM")
+            W_ARCH+=("$(image_arch_of "$FACTS")")
+            W_COMMIT+=("$(llama_commit_of "$FACTS")")
         done
 
         # Worker pods Ready — counted on THIS GROUP's worker nodes only.
@@ -1330,38 +1357,61 @@ else
             wn=$((wn + 1))
         done
 
-        # Build consistency, from the checksums collected above plus one call
-        # for the head.
+        # Build consistency, from the facts collected above plus one call for
+        # the head. Two rules, the same two orchestrator/cluster/buildcheck.py
+        # applies for `aureax start`: the llama.cpp COMMIT must be the head's
+        # on every member whose build record is readable (the RPC wire format
+        # is locked to it and it is architecture-neutral), and the rpc-server
+        # CHECKSUM must be the head's only on members of the head's
+        # architecture — a CUDA x86_64 member is a different binary by
+        # construction and is compared by commit alone.
         HEAD_SUM_RAW=$(ssh_at "$(node_index_of "$GHEAD")" "$SUM_CMD" 2>/dev/null) || HEAD_SUM_RAW=""
         HEAD_SUM="$(sha_of "$HEAD_SUM_RAW")"
+        HEAD_ARCH="$(image_arch_of "$HEAD_SUM_RAW")"
+        HEAD_COMMIT="$(llama_commit_of "$HEAD_SUM_RAW")"
         BUILD_MISMATCH=0
         UNREADABLE=""
         SUM_REASON=""
+        CROSS_ARCH=""
         [ -n "$HEAD_SUM" ] || SUM_REASON="${HEAD_SUM_RAW}"
         wn=0
         for w in "${GWORKERS[@]}"; do
             W_SUM_RAW="${W_SUM[$wn]}"
             W_SUM_HEX="$(sha_of "$W_SUM_RAW")"
-            if [ -z "$W_SUM_HEX" ]; then
+            W_ARCH_1="${W_ARCH[$wn]}"
+            W_COMMIT_1="${W_COMMIT[$wn]}"
+            if [ -n "$HEAD_COMMIT" ] && [ -n "$W_COMMIT_1" ] && [ "$W_COMMIT_1" != "$HEAD_COMMIT" ]; then
+                echo "         ${w}: llama.cpp commit ${W_COMMIT_1:0:12} differs from head ${HEAD_COMMIT:0:12}"
+                BUILD_MISMATCH=1
+            fi
+            if [ -n "$HEAD_ARCH" ] && [ -n "$W_ARCH_1" ] && [ "$W_ARCH_1" != "$HEAD_ARCH" ]; then
+                # Another architecture: the commit above is the whole check.
+                # No readable commit there means nothing was compared at all.
+                CROSS_ARCH="${CROSS_ARCH} ${w}(${W_ARCH_1})"
+                [ -n "$W_COMMIT_1" ] || UNREADABLE="${UNREADABLE} ${w}"
+            elif [ -z "$W_SUM_HEX" ]; then
                 # An unreadable checksum is NOT a mismatch — reporting it as one
                 # sends the operator rebuilding images to fix an SSH or sudo
                 # problem. The remote's own words are kept for the skip line.
                 UNREADABLE="${UNREADABLE} ${w}"
                 [ -n "$SUM_REASON" ] || SUM_REASON="${W_SUM_RAW}"
             elif [ -n "$HEAD_SUM" ] && [ "$W_SUM_HEX" != "$HEAD_SUM" ]; then
-                echo "         ${w}: rpc-server sha256 differs from head"
+                echo "         ${w}: rpc-server sha256 differs from head (same architecture${HEAD_ARCH:+ ${HEAD_ARCH}})"
                 BUILD_MISMATCH=1
             fi
             wn=$((wn + 1))
         done
-        if [ -z "$HEAD_SUM" ] || [ -n "$UNREADABLE" ]; then
-            skip "${GNAME}: llama.cpp build consistency (could not read checksum on:${UNREADABLE:- head}${SUM_REASON:+ — ${SUM_REASON}})"
-        elif [ "$BUILD_MISMATCH" -eq 0 ]; then
-            echo "  [PASS] ${GNAME}: llama.cpp build identical across all members"
-            PASS=$((PASS + 1))
-        else
+        if [ "$BUILD_MISMATCH" -eq 1 ]; then
             echo "  [FAIL] ${GNAME}: llama.cpp builds differ across members — RPC will hang at handshake"
             FAIL=$((FAIL + 1))
+        elif [ -z "$HEAD_SUM" ] || [ -n "$UNREADABLE" ]; then
+            skip "${GNAME}: llama.cpp build consistency (could not read checksum on:${UNREADABLE:- head}${SUM_REASON:+ — ${SUM_REASON}})"
+        elif [ -n "$CROSS_ARCH" ]; then
+            echo "  [PASS] ${GNAME}: llama.cpp build identical within ${HEAD_ARCH:-the head architecture}; compared by commit${HEAD_COMMIT:+ ${HEAD_COMMIT:0:12}} on:${CROSS_ARCH}"
+            PASS=$((PASS + 1))
+        else
+            echo "  [PASS] ${GNAME}: llama.cpp build identical across all members"
+            PASS=$((PASS + 1))
         fi
 
         # End-to-end: real generation through the group's single MCP endpoint.
@@ -1458,17 +1508,15 @@ else
         http_status "${NID}: /health unauthenticated is 200 (k8s probes need it)" \
             200 "${BASE}/health"
 
-        # UPGRADE TRIPWIRE — this expectation is build-specific, not universal.
-        # /v1/models is exempt from auth on the PINNED build (b10375), which is
-        # what lets a harness discover the model id before it holds a key, and
-        # what README.md's `curl .../v1/models` example promises. Upstream
-        # commit ee0ea03ad, landed immediately AFTER b10375, removed the
-        # /models and /v1/models exemptions — so the first LLAMA_CPP_VERSION
-        # bump past it flips this to 401. When that happens this is a real
-        # behaviour change, not a broken test: change the expected status to
-        # 401 here, and fix the README example that says it works without a key.
-        http_status "${NID}: /v1/models unauthenticated is 200 (b10375 exemption)" \
-            200 "${BASE}/v1/models"
+        # BUILD-SPECIFIC — /v1/models needs the key on the pinned build
+        # (b11429). It was auth-exempt through b10375; upstream removed the
+        # /models and /v1/models exemptions in b10518 (#26347), which is why
+        # README.md's `curl .../v1/models` examples now send the bearer key.
+        # A 200 here on a node whose /props check below still says 401 means
+        # that node is running a pre-b10518 image: the pin moved and this node
+        # was not rebuilt.
+        http_status "${NID}: /v1/models unauthenticated is 401 (exemption gone since b10518)" \
+            401 "${BASE}/v1/models"
 
         # Proves auth is actually ON. Without this, a node whose key was never
         # applied passes every other check in this section.

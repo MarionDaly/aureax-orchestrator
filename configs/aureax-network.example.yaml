@@ -208,22 +208,36 @@ ssh:
 # TWO GROUPS OF FOUR, not one of eight. The eight ARM units serve two
 # independent Qwen3.5-35B-A3B agents, 1 head + 3 workers each, because a 22 GB
 # model does not need eight nodes: ~6.9 GiB of weights per worker against
-# ~13.0 GiB free leaves room for a 131072-token context. Splitting also halves
-# the per-group RPC fan-out, which matters more than it looks — see the mask
-# broadcast note below.
+# ~13.0 GiB free leaves room for a 131072-token context. Splitting also keeps
+# the two agents independent, confines a lost worker to the one group it
+# serves, and cuts each group's RPC fan-out from seven workers to three — which
+# matters for PREFILL, not for decode; see the LAN note below.
 #
 # The planner picks both up automatically: ${mcp_endpoints} resolves to every
 # enabled target whose own config has mcp.server.enabled, so nothing lists
 # these two endpoints by hand.
 #
-# LAN NOTE. Both groups share one switch. The attention mask is re-sent to
-# every worker on every graph compute with no dirty tracking, so at a filled
-# 128k context each decoded token broadcasts ~16.8 MiB per worker — ~50 MiB per
-# group per token. That term is linear in worker count and quadratic in
-# context, and it shows up as "slower the longer the conversation", never as an
-# error. Three workers per group rather than seven is what keeps it tolerable.
-# Measure with ifstat on a head at a filled context before trusting 128k for
-# long sessions; context_size 32768 is the fallback.
+# LAN NOTE. Both groups share one switch. The figures here are derived from
+# llama.cpp source at b10375, not measured, and not re-derived at the current
+# pin (b11429), where an RPC head runs pipeline parallelism. The attention
+# mask is re-sent on every graph compute, with no dirty tracking, to every
+# worker that holds full-attention layers; it is [n_kv x n_tokens] F16 with no
+# row padding.
+#   DECODE is cheap on the wire. One token's mask is n_kv x 2 B — 256 KiB per
+#   worker at a filled 128k context, ~768 KiB per group. What dominates is the
+#   logits readback from the last worker (248,320 x 4 B = 993,280 B per token)
+#   plus two relayed 8 KiB hidden-state hops: ~1.06 MB per decoded token on a
+#   3-worker group at 4k of context, ~1.23 MB at 32k, ~1.82 MB at 128k, over 3
+#   blocking round trips. Seven workers would be ~2.9 MB per token at 128k.
+#   PREFILL is where the mask dominates. Each 512-token micro-batch sends
+#   n_kv x 512 x 2 B to every worker, up to 128 MiB per worker per micro-batch
+#   at 128k, so the total is linear in worker count and quadratic in prompt
+#   length: a cold 32k prompt moves ~1 GiB per worker, a cold 128k prompt
+#   ~16 GiB per worker (~48 GiB per group, roughly 440 s of 1 GbE wire time).
+#   It shows up as a slow first token on a long prompt, never as an error.
+# Measure with ifstat on a head during a long prefill before trusting 128k
+# prompts; context_size 32768 is the fallback, for prefill time and mask
+# traffic rather than for decode.
 #
 # SECURITY: rpc-server has no authentication and deserializes arbitrary tensor
 # graphs. Port 50052 must stay on a trusted LAN, firewalled to the head's IP.
@@ -285,6 +299,29 @@ node_groups:
     # llama-server exits immediately if a peer is unreachable, so the head
     # waits for every worker's RPC port before starting.
     worker_wait_timeout_seconds: 300
+
+    # OPTIONAL: carry this group's rpc-server traffic over a WireGuard star
+    # (head = hub, each worker a spoke) instead of the LAN. rpc-server is
+    # plaintext and unauthenticated by construction; with this on, each worker
+    # binds only its tunnel address and accepts only the head's tunnel address,
+    # on wg0. Left commented out (and `enabled: false` when uncommented), a
+    # fleet generates and deploys exactly what it did without it.
+    #
+    # MEASURE BEFORE ENABLING. Expected cost at 1 GbE is framing only — about
+    # +0.5 ms per decoded token and ~5% less bulk goodput (941 -> 889 Mbps at
+    # MTU 1420) — but kernel WireGuard spreads its crypto over every core, so
+    # re-run scripts/bench-decode.sh against this group's head with the tunnel
+    # on and watch A76 utilisation on the workers while it runs. Enabling it:
+    # set `enabled: true`, then `aureax generate`, `aureax apply --all` and
+    # `aureax stop && aureax start` (apply never restarts a worker). See
+    # ARCHITECTURE.md, "WireGuard transport for rpc-server".
+    #
+    # wireguard:
+    #   enabled: false
+    #   subnet: "10.254.0.0/24"     # default 10.254.<group index>.0/24; must not overlap the LAN
+    #   listen_port: 51820          # UDP on the head; workers dial it
+    #   mtu: 1420
+    #   persistent_keepalive: 25    # seconds; the head learns workers from these
 
   # Identical to group A in every respect except membership.
   - name: "qwen35b-b"

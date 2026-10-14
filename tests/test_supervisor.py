@@ -1309,9 +1309,9 @@ def test_peer_wait_names_only_the_unreachable_worker(bare_client, monkeypatch) -
 
     probed: list[str] = []
 
-    def probe(host, port, timeout=0.3):
+    def probe(host, port, timeout=1.0):
         probed.append(host)
-        return host == "10.77.0.2"
+        return ("ok", (5, 0, 0)) if host == "10.77.0.2" else ("closed", None)
 
     exits: list = []
 
@@ -1319,7 +1319,7 @@ def test_peer_wait_names_only_the_unreachable_worker(bare_client, monkeypatch) -
         exits.append(args)
         raise SystemExit(1)
 
-    monkeypatch.setattr(AureaxClient, "_port_in_use", staticmethod(probe))
+    monkeypatch.setattr(AureaxClient, "_rpc_hello", staticmethod(probe))
     monkeypatch.setattr(AureaxClient, "_exit_reporting", record_and_exit)
     monkeypatch.setattr(time, "sleep", lambda _s: None)
 
@@ -1329,6 +1329,151 @@ def test_peer_wait_names_only_the_unreachable_worker(bare_client, monkeypatch) -
     assert exits == [(1,)], "the head's death must go through _exit_reporting"
     assert probed.count("10.77.0.2") == 1, "a peer that answered was re-probed"
     assert probed.count("10.77.0.3") > 1
+
+
+# --- the peer wait speaks the RPC HELLO ---------------------------------------
+
+def _fake_rpc_server(reply: bytes | None):
+    """A one-shot TCP listener on 127.0.0.1 that records what it receives and
+    answers `reply` (or nothing, holding the connection open, when None)."""
+    import socket
+    import threading
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    received: list[bytes] = []
+    done = threading.Event()
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn:
+            conn.settimeout(3)
+            try:
+                received.append(conn.recv(64))
+                if reply is not None:
+                    conn.sendall(reply)
+                else:
+                    done.wait(3)
+            except OSError:
+                pass
+        srv.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv.getsockname()[1], received, done
+
+
+def test_rpc_hello_reads_the_servers_protocol_version() -> None:
+    """The request is the pinned build's HELLO (1 + 8 + 24 bytes, command 14);
+    the reply is a u64 size of 28 then major, minor, patch, pad, 24 caps."""
+    import struct
+
+    reply = struct.pack("<Q", 28) + bytes([7, 0, 0, 0]) + bytes(24)
+    port, received, _ = _fake_rpc_server(reply)
+
+    state, version = AureaxClient._rpc_hello("127.0.0.1", port, timeout=2.0)
+
+    assert (state, version) == ("ok", (7, 0, 0))
+    assert received and received[0] == bytes([14]) + struct.pack("<Q", 24) + bytes(24)
+
+
+def test_rpc_hello_reports_a_listener_that_does_not_speak_the_protocol() -> None:
+    """Accepts, says nothing: a pre-HELLO server or another service on the port."""
+    port, _received, done = _fake_rpc_server(None)
+    try:
+        assert AureaxClient._rpc_hello("127.0.0.1", port, timeout=0.3) == ("silent", None)
+    finally:
+        done.set()
+
+
+def test_rpc_hello_reports_a_closed_port() -> None:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    assert AureaxClient._rpc_hello("127.0.0.1", port, timeout=0.3) == ("closed", None)
+
+
+def _head_waiting_on(bare_client, monkeypatch, tmp_path, build_json: str | None, answers):
+    """A head whose peer wait is driven by `answers`, with the image's build
+    record (and so the expected RPC protocol) set to `build_json`."""
+    import client.entrypoint as entrypoint_mod
+
+    client = bare_client()
+    client.config = {
+        "node": {"role": "edge_executor", "worker_wait_timeout_seconds": 1},
+        "model": {"server": {"rpc_servers": ["10.77.0.2:50052"]}},
+    }
+    client._shutdown = False
+    record = tmp_path / "llama-build.json"
+    if build_json is not None:
+        record.write_text(build_json)
+    monkeypatch.setattr(entrypoint_mod, "_LLAMA_BUILD_JSON", str(record))
+    monkeypatch.setattr(AureaxClient, "_rpc_hello", staticmethod(lambda h, p, timeout=1.0: answers.pop(0)))
+    exits: list = []
+
+    def record_and_exit(_self, *args):
+        exits.append(args)
+        raise SystemExit(1)
+
+    monkeypatch.setattr(AureaxClient, "_exit_reporting", record_and_exit)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    return client, exits
+
+
+def test_a_worker_on_another_rpc_protocol_fails_the_head_at_once(bare_client, monkeypatch, tmp_path, caplog) -> None:
+    """Two llama.cpp builds in one group hang at the RPC handshake. With the
+    image's own protocol recorded, the head refuses by name before llama-server
+    ever connects, instead of after the 300 s wait plus a hang."""
+    client, exits = _head_waiting_on(
+        bare_client, monkeypatch, tmp_path,
+        '{"version":"b11439","commit":"abc","rpc_proto":"7.0.0"}',
+        [("ok", (5, 0, 0))],
+    )
+    with caplog.at_level("ERROR"), pytest.raises(SystemExit):
+        client._wait_for_rpc_workers()
+    assert exits == [(1,)]
+    assert "5.0.0" in caplog.text and "expects 7.0" in caplog.text
+    assert "build-on-node.sh" in caplog.text
+
+
+def test_a_worker_on_the_same_rpc_protocol_is_accepted(bare_client, monkeypatch, tmp_path, caplog) -> None:
+    client, exits = _head_waiting_on(
+        bare_client, monkeypatch, tmp_path,
+        '{"version":"b11439","commit":"abc","rpc_proto":"7.0.0"}',
+        [("ok", (7, 0, 3))],
+    )
+    with caplog.at_level("INFO"):
+        client._wait_for_rpc_workers()
+    assert exits == []
+    assert "RPC protocol 7.0.3" in caplog.text
+
+
+def test_an_image_without_a_recorded_protocol_compares_nothing(bare_client, monkeypatch, tmp_path, caplog) -> None:
+    """Images built before the key existed must not be refused by a check they
+    cannot pass; the worker's version is still logged."""
+    client, exits = _head_waiting_on(
+        bare_client, monkeypatch, tmp_path,
+        '{"version":"b10375","commit":"ba360efe"}',
+        [("ok", (5, 0, 0))],
+    )
+    with caplog.at_level("INFO"):
+        client._wait_for_rpc_workers()
+    assert exits == []
+    assert "RPC protocol 5.0.0" in caplog.text
+
+
+def test_a_silent_listener_is_warned_about_once_and_waited_for(bare_client, monkeypatch, tmp_path, caplog) -> None:
+    client, exits = _head_waiting_on(
+        bare_client, monkeypatch, tmp_path, None,
+        [("silent", None), ("silent", None), ("ok", (5, 0, 0))],
+    )
+    with caplog.at_level("WARNING"):
+        client._wait_for_rpc_workers()
+    assert exits == []
+    assert caplog.text.count("did not answer the RPC HELLO") == 1
 
 
 def test_worker_cache_dir_falls_back_and_is_exported_expanded(bare_client, tmp_path, monkeypatch) -> None:
@@ -1394,6 +1539,171 @@ def test_worker_cache_dir_defaults_when_left_empty(bare_client, tmp_path, monkey
 
     assert os.environ["LLAMA_CACHE"] == "/opt/aureax/rpc-cache"
     assert "/opt/aureax/rpc-cache" in made
+
+
+# --- head topology check counts devices, not peers ------------------------------
+
+def test_topology_check_compares_against_the_stamped_device_count(bare_client, monkeypatch) -> None:
+    """A worker exposing two GPUs is two RPC devices behind one address, so a
+    four-entry split over three peers is right when the generator stamped 4."""
+    client = bare_client()
+    exits: list = []
+    monkeypatch.setattr(AureaxClient, "_exit_reporting", lambda _s, *a: exits.append(a) or (_ for _ in ()).throw(SystemExit(1)))
+    peers = ["a:1", "b:1", "c:1"]
+
+    client.config = {"model": {"server": {"rpc_servers": peers, "tensor_split": [1, 1, 1, 1], "rpc_device_count": 4}}}
+    client._verify_rpc_topology()
+    assert exits == []
+
+    client.config = {"model": {"server": {"rpc_servers": peers, "tensor_split": [1, 1, 1], "rpc_device_count": 4}}}
+    with pytest.raises(SystemExit):
+        client._verify_rpc_topology()
+    assert exits == [(1,)]
+
+    # Without a stamp the peer count is the device count, as before.
+    client.config = {"model": {"server": {"rpc_servers": peers, "tensor_split": [1, 1, 1]}}}
+    client._verify_rpc_topology()
+
+
+# --- worker tensor-cache audit --------------------------------------------------
+
+def _worker_cache(tmp_path: Path, files: dict[str, int]) -> Path:
+    """A fake rpc-server cache at tmp_path/rpc-cache/rpc/ with the given sizes."""
+    rpc_dir = tmp_path / "rpc-cache" / "rpc"
+    rpc_dir.mkdir(parents=True)
+    for name, size in files.items():
+        (rpc_dir / name).write_bytes(b"x" * size)
+    return tmp_path / "rpc-cache"
+
+
+def _manifest(path: Path, entries: list[dict]) -> Path:
+    import json
+
+    path.write_text(json.dumps({"threshold": 10 * 1024 * 1024, "entries": entries}))
+    return path
+
+
+def test_cache_audit_keeps_manifest_weights_and_removes_the_rest(bare_client, tmp_path, monkeypatch) -> None:
+    """With a hashed manifest a file is judged by name AND size.
+
+    A truncated weight (right name, wrong size) is the silent-partial-tensor
+    hazard: rpc-server trusts the file's size on a hit and never re-hashes.
+    An unknown name is what the pinned build writes for every prefill mask
+    over 10 MiB. A dotfile is the seeder's partial export.
+    """
+    import client.entrypoint as entrypoint_mod
+
+    cache = _worker_cache(tmp_path, {
+        "0123456789abcdef": 100,   # known, right size
+        "fedcba9876543210": 50,    # known, truncated
+        "00000000deadbeef": 70,    # unknown name
+        ".0123456789abcdef.tmp": 10,
+    })
+    manifest = _manifest(tmp_path / "manifest.json", [
+        {"name": "blk.0.a", "offset": 0, "nbytes": 100, "hash": "0123456789abcdef"},
+        {"name": "blk.0.b", "offset": 100, "nbytes": 200, "hash": "fedcba9876543210"},
+    ])
+    monkeypatch.setattr(entrypoint_mod, "_RPC_CACHE_MANIFEST", str(manifest))
+
+    client = bare_client()
+    client._audit_rpc_cache(str(cache), 0)
+
+    assert sorted(p.name for p in (cache / "rpc").iterdir()) == ["0123456789abcdef"]
+
+
+def test_cache_audit_with_a_sizes_only_manifest_judges_by_size(bare_client, tmp_path, monkeypatch) -> None:
+    """A manifest written without --hash still tells a weight from a mask by size."""
+    import client.entrypoint as entrypoint_mod
+
+    cache = _worker_cache(tmp_path, {"aaaaaaaaaaaaaaaa": 100, "bbbbbbbbbbbbbbbb": 77})
+    manifest = _manifest(tmp_path / "manifest.json", [
+        {"name": "blk.0.a", "offset": 0, "nbytes": 100, "hash": None},
+    ])
+    monkeypatch.setattr(entrypoint_mod, "_RPC_CACHE_MANIFEST", str(manifest))
+
+    bare_client()._audit_rpc_cache(str(cache), 0)
+
+    assert sorted(p.name for p in (cache / "rpc").iterdir()) == ["aaaaaaaaaaaaaaaa"]
+
+
+def test_cache_audit_without_a_manifest_deletes_nothing_but_dotfiles(bare_client, tmp_path, monkeypatch) -> None:
+    """No manifest means no way to tell weights from masks: report only."""
+    import client.entrypoint as entrypoint_mod
+
+    cache = _worker_cache(tmp_path, {"aaaaaaaaaaaaaaaa": 100, "bbbbbbbbbbbbbbbb": 77, ".partial.tmp": 5})
+    monkeypatch.setattr(entrypoint_mod, "_RPC_CACHE_MANIFEST", str(tmp_path / "absent.json"))
+
+    bare_client()._audit_rpc_cache(str(cache), 0)
+
+    assert sorted(p.name for p in (cache / "rpc").iterdir()) == ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]
+
+
+def test_cache_audit_treats_an_unreadable_manifest_as_absent(bare_client, tmp_path, monkeypatch) -> None:
+    """A corrupt manifest must not become 'delete everything'."""
+    import client.entrypoint as entrypoint_mod
+
+    cache = _worker_cache(tmp_path, {"aaaaaaaaaaaaaaaa": 100})
+    bad = tmp_path / "manifest.json"
+    bad.write_text("{not json")
+    monkeypatch.setattr(entrypoint_mod, "_RPC_CACHE_MANIFEST", str(bad))
+
+    bare_client()._audit_rpc_cache(str(cache), 0)
+
+    assert [p.name for p in (cache / "rpc").iterdir()] == ["aaaaaaaaaaaaaaaa"]
+
+
+def test_cache_audit_refuses_to_start_below_the_free_disk_floor(bare_client, tmp_path, monkeypatch) -> None:
+    """A full cache filesystem takes the kubelet with it, so the worker stops here."""
+    import shutil
+
+    import client.entrypoint as entrypoint_mod
+
+    cache = _worker_cache(tmp_path, {})
+    monkeypatch.setattr(entrypoint_mod, "_RPC_CACHE_MANIFEST", str(tmp_path / "absent.json"))
+    monkeypatch.setattr(
+        shutil, "disk_usage",
+        lambda _p: types.SimpleNamespace(total=100 * 2**30, used=99 * 2**30, free=1 * 2**30),
+    )
+    exits: list[int] = []
+
+    def fake_exit(self, status, rc=None):
+        exits.append(status)
+        raise SystemExit(status)
+
+    monkeypatch.setattr(AureaxClient, "_exit_reporting", fake_exit)
+
+    with pytest.raises(SystemExit):
+        bare_client()._audit_rpc_cache(str(cache), 4.0)
+    assert exits == [1]
+
+    # The floor is a floor, not a trip at any value: 0 disables it.
+    bare_client()._audit_rpc_cache(str(cache), 0)
+
+
+def test_worker_audits_its_cache_after_shipping_starts_and_before_rpc_server(bare_client, tmp_path, monkeypatch) -> None:
+    """Order is the contract: the audit's warnings must be shippable, and the
+    cache must not be edited under a running rpc-server."""
+    client = bare_client()
+    client.config = {
+        "model": {"rpc_server": {"cache": True, "cache_dir": str(tmp_path / "rpc-cache"), "min_free_disk_gib": 0}},
+        "logging": {"llama_log_path": str(tmp_path / "rpc-server.log")},
+    }
+    client._shutdown = True
+    client._child_proc = _FakeChild(rc=0)
+    monkeypatch.setenv("LLAMA_CACHE", "")
+    monkeypatch.delenv("LLAMA_CACHE")
+
+    order: list[str] = []
+    monkeypatch.setattr(AureaxClient, "_start_log_shipping", lambda _s: order.append("ship"))
+    monkeypatch.setattr(AureaxClient, "_audit_rpc_cache", lambda _s, d, f: order.append(f"audit:{Path(d).name}:{f}"))
+    monkeypatch.setattr(AureaxClient, "_spawn_child", lambda *_a, **_k: order.append("spawn"))
+    monkeypatch.setattr(AureaxClient, "_wait_for_rpc_listening", lambda *_a, **_k: None)
+    monkeypatch.setattr(AureaxClient, "_start_telemetry", lambda _s: None)
+
+    with pytest.raises(SystemExit):
+        client._run_shard_worker()
+
+    assert order == ["ship", "audit:rpc-cache:0.0", "spawn"]
 
 
 # --- telemetry startup --------------------------------------------------------
@@ -2013,7 +2323,7 @@ def test_a_tensor_split_that_outnumbers_the_rpc_peers_exits(
     assert exc.value.code == 1
     message = caplog.records[-1].getMessage()
     assert "tensor_split has 3 entries" in message
-    assert "names 2 peer(s)" in message
+    assert "2 peer(s) expose 2 RPC device(s)" in message
     assert "aureax apply --node shard-head" in message
 
 

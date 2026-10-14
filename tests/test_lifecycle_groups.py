@@ -49,18 +49,25 @@ def _stub_start_validation(monkeypatch) -> None:
 # coherent group and the digest version of this gate failed every real start.
 _SUMS_A = ("a" * 64, "b" * 64)
 _SUMS_B = ("c" * 64, "d" * 64)
+# The llama.cpp commit each image recorded at build time. The gate compares it
+# on every member, and the checksums above only within the head's architecture.
+_COMMIT_A = "0f1e2d3c"
+_COMMIT_B = "9a8b7c6d"
 
 
 def _stub_build_probe(
     monkeypatch, sums: dict[str, tuple[str, str]] | None = None,
     unreadable: tuple[str, ...] = (),
+    commits: dict[str, str] | None = None,
+    arches: dict[str, str] | None = None,
 ) -> list[str]:
     """Answer the pre-start build gate's SSH probe from a table.
 
     Without this every test driving a grouped fleet through the label phase
-    would open a real SSH connection to 10.77.0.x. Members default to ``_SUMS_A``
-    — a coherent group — so a test only has to say what is odd about its fleet.
-    Returns the node ids the gate actually asked about.
+    would open a real SSH connection to 10.77.0.x. Members default to
+    ``_SUMS_A``, ``_COMMIT_A`` and aarch64 — a coherent group — so a test only
+    has to say what is odd about its fleet. Returns the node ids the gate
+    actually asked about.
     """
     from orchestrator.cluster import buildcheck
 
@@ -76,10 +83,13 @@ def _stub_build_probe(
                 }
                 continue
             llama, rpc = (sums or {}).get(target.node_id, _SUMS_A)
+            commit = (commits or {}).get(target.node_id, _COMMIT_A)
             facts[target.node_id] = {
                 buildcheck.HOST_KEY: target.host,
                 buildcheck.LLAMA_SHA_KEY: llama,
                 buildcheck.RPC_SHA_KEY: rpc,
+                buildcheck.BUILD_KEY: f'{{"version":"b10375","commit":"{commit}"}}',
+                buildcheck.ARCH_KEY: (arches or {}).get(target.node_id, "aarch64"),
             }
         return facts
 
@@ -1346,7 +1356,9 @@ def test_a_failed_label_strip_aborts_the_start(
 # side — 50 minutes of 0/1 Running until the startupProbe budget expires.
 #
 # The gate asks the NODES for the sha256 of llama-server and rpc-server inside
-# their images. It used to compare the pods' image digests instead, and that
+# their images, plus the llama.cpp commit and architecture each image records:
+# the commit must match on every member, the checksums only within the head's
+# architecture. It used to compare the pods' image digests instead, and that
 # refused every start on the real fleet: each node builds `aureax-client:dev`
 # natively, so the digests differ by construction while the binaries do not.
 
@@ -1369,6 +1381,51 @@ def test_a_worker_running_other_binaries_than_the_head_fails_the_start(monkeypat
     message = str(exc.value)
     assert _SUMS_A[1][:12] in message and _SUMS_B[1][:12] in message, "name both checksums"
     assert "FAIL w1" in message, "name the odd node out"
+    assert "./scripts/build-on-node.sh" in message and "./scripts/update-all.sh" in message
+    assert kc.labelled == [], "labelled a node in a group that cannot serve"
+    assert order == [], "patched a selector on a known-broken group"
+
+
+def test_a_cuda_member_on_the_heads_commit_passes_the_gate(monkeypatch) -> None:
+    """An x86_64 image can never hold the bytes an aarch64 one does, so the
+    gate compares it by commit — the property the RPC protocol is locked to —
+    and says so in the start log rather than passing it silently."""
+    cfg = _grouped_fleet()
+    order: list[str] = []
+    _phase_env(monkeypatch, edges=("host-h",), workers=("host-w1",), order=order)
+    _stub_build_probe(monkeypatch, sums={"w1": _SUMS_B}, arches={"w1": "x86_64"})
+    log = FakeLog()
+
+    lifecycle._start_phase_label_and_wait_pods(
+        cfg, log, None, _PhaseKubectl(["host-h", "host-w1"])
+    )
+
+    assert "wait:aureax-edge" in order
+    assert any(
+        lvl == "info"
+        and f"g: OK   w1: x86_64 member compared by commit: same commit {_COMMIT_A}" in text
+        for lvl, text in log.lines
+    ), log.lines
+
+
+def test_a_member_on_another_commit_fails_the_start_naming_both_commits(monkeypatch) -> None:
+    """Another architecture changes what is compared, never whether the version
+    lock holds: a CUDA member built from another commit hangs the handshake
+    exactly like an aarch64 one would."""
+    cfg = _grouped_fleet()
+    kc = _PhaseKubectl(["host-h", "host-w1"])
+    order: list[str] = []
+    _phase_env(monkeypatch, edges=("host-h",), workers=("host-w1",), order=order)
+    _stub_build_probe(
+        monkeypatch, sums={"w1": _SUMS_B}, commits={"w1": _COMMIT_B}, arches={"w1": "x86_64"}
+    )
+
+    with pytest.raises(RuntimeError, match="HANGS at the handshake") as exc:
+        lifecycle._start_phase_label_and_wait_pods(cfg, FakeLog(), None, kc)
+
+    message = str(exc.value)
+    assert _COMMIT_A in message and _COMMIT_B in message, "name both commits"
+    assert "FAIL w1" in message and "head h" in message, "name both nodes"
     assert "./scripts/build-on-node.sh" in message and "./scripts/update-all.sh" in message
     assert kc.labelled == [], "labelled a node in a group that cannot serve"
     assert order == [], "patched a selector on a known-broken group"

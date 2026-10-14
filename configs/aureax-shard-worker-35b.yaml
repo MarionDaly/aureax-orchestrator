@@ -104,12 +104,21 @@ model:
 
     # Local tensor cache. Without it, every pod restart re-pulls this node's
     # multi-GiB share of the weights across the network before it can serve.
+    # It is content-addressed — one file per tensor over 10 MiB, named by a
+    # hash of the tensor's bytes — so a restart reloads warm, and a resize or
+    # reorder re-ships only the tensors this worker never received (derived
+    # from llama.cpp source at b10375). At the pinned build (b11429) the hash
+    # cache applies to WEIGHTS only, so the prefill-mask cache growth b10375
+    # suffered is fixed there.
     cache: true
     cache_dir: "/opt/aureax/rpc-cache"
 
     # No memory knob here on purpose: rpc-server in the pinned build accepts
-    # only -h/-t/-d/-H/-p/-c and advertises its real free memory to the head
-    # itself. See RpcServerConfig in orchestrator/config/schema.py.
+    # only -h/-t/-d/-H/-p/-c and reports its memory to the head itself. That
+    # figure is not real free memory: at b11429 the CPU device reports
+    # free = total = physical RAM, neither cgroup-aware nor usage-aware, and it
+    # is what llama.cpp would split by if tensor_split were left empty. See
+    # RpcServerConfig in orchestrator/config/schema.py.
 
 # ----------------------------------------------------------------------------
 # 3. AGENT PROMPT & PERSONA (unused — no agent runs on a worker)

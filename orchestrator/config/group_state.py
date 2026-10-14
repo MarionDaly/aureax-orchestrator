@@ -183,18 +183,21 @@ def order_problems(network_config_path: Path, network_config) -> tuple[list[str]
       here rather than under "resized". Fatal even when the split is uniform
       (``[1, 1, 1]``, ``configs/aureax-shard-head-35b.yaml``): that file's own
       comment says order-independence holds only while every entry is equal,
-      which is one edit away, and any of these invalidates every worker's
-      tensor cache regardless. One verdict per group — a middle insert is
-      reported as the reorder it is, not as the resize it also is.
+      which is one edit away. Any of these also moves layers between workers,
+      and the layers that moved are a partial cold load — the tensor cache is
+      content-addressed, so no file is invalidated; a worker simply misses the
+      tensors it never received — but the device renumbering is the hazard,
+      not the load. One verdict per group — a middle insert is reported as the
+      reorder it is, not as the resize it also is.
     * Every RETAINED worker kept its slot, but the list is not the same —
       warning. Three shapes reach this: an append, a removal from the tail, and
       a same-length REPLACEMENT (``[a1, a2, a3]`` -> ``[a1, a9, a3]``, which is
       also what promoting a worker to head and demoting the old head back into
       its slot looks like from here — the documented 122B rollback). All three
-      cost a cold load, not a wrong answer: no retained worker's ``--rpc`` slot
-      moved, so every ``tensor_split`` entry still carries the share it was
-      written for, and a replaced slot hands that share to the machine that
-      took the old one's place.
+      cost a (partial) cold load, not a wrong answer: no retained worker's
+      ``--rpc`` slot moved, so every ``tensor_split`` entry still carries the
+      share it was written for, and a replaced slot hands that share to the
+      machine that took the old one's place.
     * A worker kept its slot but changed host — warning, same reasoning.
 
     A change of ``head`` or ``rpc_port`` gets no verdict of its own: both are
@@ -319,9 +322,10 @@ def _membership_warning(name: str, was_ids: list[str], now_ids: list[str]) -> st
     )
     return (
         f"group {name!r}: workers changed from {len(was_ids)} to {len(now_ids)} "
-        f"({changes}) — every worker's tensor cache is invalidated, so the next "
-        "start is a COLD load: the head streams every tensor over the LAN again. "
-        "Minutes, not seconds. Not an error."
+        f"({changes}) — the next start is a COLD load for every tensor that lands "
+        "on a worker that never held it: the tensor cache is content-addressed, so "
+        "nothing is invalidated, but the head streams those tensors over the LAN "
+        "again. Minutes, not seconds. Not an error."
     )
 
 
@@ -331,9 +335,10 @@ def _host_warnings(name: str, was: list[list[str]], now: list[list[str]]) -> lis
         (
             f"group {name!r}: worker {new_id!r} kept its RPC{slot} slot but its host "
             f"changed from {old_host} to {new_host} — that --rpc entry now points at a "
-            "different machine, so the next start is a COLD load for the whole group "
-            "(the new peer has no tensor cache) and the old one is left holding a stale "
-            "share of the weights. Not an error."
+            "different machine, so the next start is a COLD load of that slot's whole "
+            "share (the new peer's tensor cache does not hold it; the other workers' "
+            "caches still hold theirs) and the old one is left holding a stale share "
+            "of the weights. Not an error."
         )
         for slot, ((_, old_host), (new_id, new_host)) in enumerate(zip(was, now, strict=True))
         if old_host != new_host

@@ -335,9 +335,10 @@ each still gets its own key, because `${api_key}` resolves per target.
   SSH-pushes to the requested nodes plus their whole group, and restarts only
   heads and standalone nodes, with a targeted delete of the one pod on the one
   node. Shard workers are pushed but never restarted: `rpc-server` takes no key,
-  and restarting one forces a cold group reload. `kubectl rollout restart` is
+  and restarting one forces a whole-group reload — warm, because the worker's
+  tensor cache survives it (§3), but still minutes. `kubectl rollout restart` is
   banned by `tests/test_apply.py::test_restart_never_uses_rollout_restart`,
-  because a DaemonSet rollout is serial and would cold-reload every head in the
+  because a DaemonSet rollout is serial and would reload every head in the
   fleet for a one-node config change. `aureax start` does not push configs and
   is never a substitute.
 - **Going fleet-wide is opt-in.** `apply` requires `--node <id>` (repeatable) or
@@ -373,16 +374,17 @@ each still gets its own key, because `${api_key}` resolves per target.
   covers both doors of a service: this key gates `:8080` and `:30800`, and the
   MCP key gates `:9000` and `:30900` (below). The one door with neither TLS nor
   a key is a shard worker's `rpc-server` on `:50052` (§3, Security).
-- **Auth-exempt endpoints are build-specific.** On the pinned build (**b10375**,
-  `LLAMA_CPP_VERSION` in both Dockerfiles) `/health`, `/v1/health`, `/models`,
-  `/v1/models` and the web-UI assets are exempt from the key; everything else,
-  `/metrics` included, 401s without it. `/health` staying public is what lets
+- **Auth-exempt endpoints are build-specific.** On the pinned build (**b11429**,
+  `LLAMA_CPP_VERSION` in both Dockerfiles) only `/health`, `/v1/health`, `/`
+  and the web-UI assets are exempt from the key, and `OPTIONS` requests skip
+  auth; everything else, `/metrics`, `/props`, `/slots`, `/models` and
+  `/v1/models` included, 401s without it. `/health` staying public is what lets
   the kubelet's probes work, so losing that exemption crash-loops the node
-  rather than locking out clients. The `/models` exemptions are removed upstream
-  immediately after b10375, so a version bump flips them:
-  `scripts/test-all.sh` section 7 probes `/v1/models` unauthenticated as the
-  tripwire, and treats a flip as a real behaviour change to be reflected in the
-  docs, not a broken test.
+  rather than locking out clients. `/models` and `/v1/models` were exempt
+  through b10375 and upstream removed that exemption in b10518 (#26347), so a
+  client's model discovery now needs the key: `scripts/test-all.sh` section 7
+  asserts unauthenticated `/v1/models` is 401, and a 200 there from a node
+  whose `/props` still 401s means that node is running a pre-b10518 image.
 
 README's Configuration section is the operator-facing walkthrough for turning
 auth on.
@@ -808,7 +810,10 @@ springs on a rollback.
 | **A planner's `remote_servers` is derived, never listed** | **`templating.validate_planners`** | **`test_node_groups.py::test_validate_planners_rejects_a_hardcoded_remote_servers_list`** |
 | **A role change REMOVES the other gating label** | `deployer.label_nodes` / `label_shard_workers` **and `lifecycle._start_phase_label_and_wait_pods`**, both through **`cluster.labels.strip_conflicting_label`** | `test_deployer.py::test_edge_label_pass_strips_the_shard_label_it_replaces`; **`test_lifecycle_groups.py::test_start_strips_the_edge_label_from_a_node_it_labels_as_a_worker`** |
 | **A node carrying both labels is loud, and one this start cannot fix aborts it** | **`cluster.labels.double_labelled_nodes` via `lifecycle._preflight_double_labels`; printed in red by `cli._status_cluster`** | **`test_lifecycle_groups.py::test_a_double_labelled_node_this_start_does_not_claim_aborts_the_start`; `test_labels.py::test_a_node_carrying_both_label_keys_is_reported`** |
-| **Every peer runs the byte-identical llama.cpp binaries** | **`cluster.buildcheck.compare_group`** over the sha256 of `llama-server` and `rpc-server` read inside each member's image over SSH, one round trip per member — run by **`lifecycle._assert_group_builds_match`** (pre-start, before anything is labelled: mismatch raises, unreadable member warns) and by **`cli._group_problems`** (`group doctor`, exit 1); `test-all.sh` §6 asks the same question of `rpc-server`. **NOT the image digest**: every node builds `aureax-client:dev` natively (`scripts/build-on-node.sh`), so digests differ across a coherent group and a digest gate would refuse every real start | **`test_buildcheck.py::test_a_worker_with_a_different_rpc_server_is_a_problem`, `…::test_an_unreadable_member_is_a_note_not_a_problem`; `test_lifecycle_groups.py::test_a_worker_running_other_binaries_than_the_head_fails_the_start`, `…::test_the_build_gate_runs_before_anything_is_labelled`; `test_cli.py::test_doctor_exits_one_when_a_members_binaries_differ`** |
+| **Every peer runs the same llama.cpp commit; peers of the head's architecture run byte-identical binaries** | **`cluster.buildcheck.compare_group`** over one container start inside each member's image, over SSH, one round trip per member: the `commit` in `/usr/local/share/aureax-llama-build.json` must be the head's on every member, and the sha256 of `llama-server`/`rpc-server` must be the head's on every member whose `uname -m` (`image_arch`) is the head's. The RPC protocol is fixed by the commit and is architecture-neutral, so a member of another architecture is compared by commit alone and gets its own OK line; a commit mismatch wins; an unreported architecture is still held to identical binaries; an unreadable build record or checksum is a note. Run by **`lifecycle._assert_group_builds_match`** (pre-start, before anything is labelled: mismatch raises, unreadable member warns) and by **`cli._group_problems`** (`group doctor`, exit 1); `test-all.sh` §6 applies the same two rules in shell. **NOT the image digest**: every node builds `aureax-client:dev` natively (`scripts/build-on-node.sh`), so digests differ across a coherent group and a digest gate would refuse every real start. The embedded web UI is pinned to the tag's own asset (`-DHF_UI_VERSION`) so same-commit builds made on different days stay byte-identical | **`test_buildcheck.py::test_a_worker_with_a_different_rpc_server_is_a_problem`, `…::test_an_unreadable_member_is_a_note_not_a_problem`, `…::test_a_same_commit_member_of_another_architecture_passes_on_the_commit`, `…::test_a_member_of_another_architecture_on_another_commit_fails_naming_both`, `…::test_a_different_commit_with_identical_binaries_fails_on_the_commit`, `…::test_an_unreported_architecture_never_relaxes_the_binary_check`; `test_lifecycle_groups.py::test_a_worker_running_other_binaries_than_the_head_fails_the_start`, `…::test_a_member_on_another_commit_fails_the_start_naming_both_commits`, `…::test_the_build_gate_runs_before_anything_is_labelled`; `test_cli.py::test_doctor_exits_one_when_a_members_binaries_differ`, `…::test_doctor_passes_a_cuda_member_built_from_the_heads_commit`** |
+| **The head's peer wait speaks the RPC HELLO, not a bare TCP connect** | **`client/entrypoint.py::_rpc_hello`** sends the pinned build's HELLO (command 14, 24 capability bytes) to each worker from `_wait_for_rpc_workers`, only before llama-server attaches (the orchestrator still never dials `:50052`); a worker whose protocol major.minor differs from the `rpc_proto` in this image's `llama-build.json` fails the head at once, by name, with both versions; a listener that accepts but does not answer is warned about once and waited for; an image without a recorded protocol compares nothing | **`test_supervisor.py::test_rpc_hello_reads_the_servers_protocol_version`, `…::test_a_worker_on_another_rpc_protocol_fails_the_head_at_once`, `…::test_an_image_without_a_recorded_protocol_compares_nothing`, `…::test_a_silent_listener_is_warned_about_once_and_waited_for`** |
+| **A worker's tensor cache holds only weights the manifest knows, whole, and leaves room on disk** | **`client/entrypoint.py::_audit_rpc_cache`** before `rpc-server` starts (after log shipping, so the result ships): with the deployer-installed `/etc/aureax/rpc-cache-manifest.json` (from `scripts/seed-rpc-cache.py manifest`, written by `download-model.sh`) a file is judged by name and size — truncated weights and unknown files (the pinned build's prefill-mask writes before b10985) are removed; without a manifest it reports and deletes only dotfiles; below `rpc_server.min_free_disk_gib` the worker refuses to start | **`test_supervisor.py::test_cache_audit_keeps_manifest_weights_and_removes_the_rest`, `…::test_cache_audit_without_a_manifest_deletes_nothing_but_dotfiles`, `…::test_cache_audit_refuses_to_start_below_the_free_disk_floor`, `…::test_worker_audits_its_cache_after_shipping_starts_and_before_rpc_server`; `test_deployer.py::test_shard_workers_receive_their_heads_rpc_cache_manifest`** |
+| **`tensor_split` counts RPC devices, not workers, and placement is computed from the group** | **`templating.group_device_count`** (one device per worker unless `rpc_server.devices` names several) is what `validate_groups` length-checks a literal split against; `${tensor_split}` / `${gpu_layers}` resolve per group through **`orchestrator/config/placement.py`** (a transcription of llama.cpp's `get_layer_buft_list`: integer slot counts, the last one larger for the output tensor; `node_groups.head_layers` / `.placement`), and `head_layers > 0` requires the placeholders; the generator stamps `model.server.rpc_device_count` on the head, which **`client/entrypoint.py::_verify_rpc_topology`** compares the node's own split against | **`test_placement.py` (whole module); `test_node_groups.py::test_tensor_split_is_checked_against_devices_not_workers`, `…::test_head_resident_layers_require_the_placement_placeholders`, `…::test_build_variables_place_the_head_from_the_group`, `…::test_generated_head_is_stamped_with_the_device_count`; `test_supervisor.py::test_topology_check_compares_against_the_stamped_device_count`** |
 | `LLAMA_CPP_VERSION` identical in both Dockerfiles | `scripts/test-all.sh` §1 | `test_manifest_tls.py::test_both_dockerfiles_pin_the_same_llama_cpp_build` |
 | **The pinned tag still resolves to the pinned commit** | each Dockerfile's build stage compares the cloned `HEAD` against `LLAMA_CPP_COMMIT` and fails the build on the node, naming both shas — a tag is mutable upstream, and a moved one would otherwise hand two nodes different binaries under one version string | `test_manifest_tls.py::test_both_dockerfiles_pin_the_same_llama_cpp_commit` |
 | **The group config is valid at START, not only at generate** | **`lifecycle._start_phase_validate_config`** (runs `validate_groups` + `validate_planners` before the cluster is touched) | **`test_lifecycle_groups.py::test_start_validates_the_group_config_before_touching_the_cluster`** |
@@ -830,6 +835,7 @@ springs on a rollback.
 | `rpc-server` `:50052` stays firewalled to the head | `client/rpc_firewall.py` in the shard pod's `rpc-firewall` init container installs and verifies the `AUREAX_RPC_<port>` chain for every IP family the host has, before RPC starts | `test_rpc_firewall.py::test_rpc_firewall_installs_both_families_with_drop_after_head_and_local`, `…::test_rpc_firewall_failure_blocks_init_completion`, `…::test_rpc_firewall_requires_a_head_before_touching_rules`, `…::test_an_unreadable_rule_table_refuses_rpc_startup` |
 | **A worker's RPC allowlist holds IP literals, derived from its group head** | `templating.generate_edge_config` resolves the head on the orchestrator and writes `model.rpc_server.allowed_clients`; `rpc_firewall._peer_address` refuses a non-literal by name, since the init container resolves nothing | `test_rpc_firewall.py::test_a_hostname_in_the_allowlist_is_refused_by_name` |
 | **Only a recorded child is ever signalled as an orphan** | `client/process_ownership.reap` — pid, start time and boot id must all match a record whose owning supervisor has exited | `test_process_ownership.py::test_unrecorded_processes_are_never_signalled`, `…::test_reused_pids_and_live_supervisors_are_never_killed`, `…::test_a_live_child_this_supervisor_owns_is_still_a_conflict` |
+| **rpc-server listens only on wg0 when the group has WireGuard** | `client/config/parser.py::resolve_rpc_host` binds the stamped `node.wireguard.address`; `client/rpc_firewall.py` accepts the head only as `-i wg0 -s <head tunnel address>` and waits for that address before RPC starts; `templating.generate_edge_config` stamps the block and writes the head's tunnel address as the worker's only `allowed_clients` entry; `validate_groups` refuses a literal `rpc_server.host` in such a group | `test_rpc_args.py::test_auto_binds_the_wireguard_address_when_the_node_carries_one`; `test_rpc_firewall.py::test_under_wireguard_the_head_is_accepted_only_on_the_tunnel_interface`, `…::test_the_firewall_waits_for_the_tunnel_address_before_rpc_starts`; `test_node_groups.py::test_enabling_one_group_changes_only_that_groups_configs`, `…::test_a_fleet_without_wireguard_generates_exactly_what_it_did_before`, `…::test_a_worker_with_a_literal_rpc_host_is_refused_under_wireguard` |
 
 Four things about that table are worth stating outright.
 
@@ -837,9 +843,9 @@ Four things about that table are worth stating outright.
 absence is deliberate.** `_verify_rpc_topology` compares the node's own
 `tensor_split` against its own `rpc_servers` — a structural check on the file
 the node actually has, which is what `validate_groups` cannot see. It stops
-there because on the pinned build (b10375) `/props` carries no device list and
-no flash-attention field, and `llama-server.log` at the default verbosity prints
-neither. A check reading a guessed JSON key or log pattern would be inert while
+there because at b10375 (verified live; not re-checked at the current pin,
+b11429) `/props` carries no device list and no flash-attention field, and
+`llama-server.log` at the default verbosity prints neither. A check reading a guessed JSON key or log pattern would be inert while
 looking enforced — the worst kind of check, because the fleet reads as green and
 nothing is watching. The flash-attention invariant is
 enforced instead by the worker memory limit in `k8s/daemonset-shard.yaml`,
@@ -893,6 +899,95 @@ tensor, several GiB per worker at 128k
 context on nodes with no swap. `llama-server.log`'s "Flash Attention enabled"
 line is the only runtime source of truth, for the reason in the first note.
 
+### LAN traffic and the worker tensor cache
+
+Everything in this subsection is **derived from llama.cpp source at build
+b10375** (commit `ba360efe`), not measured. The pin has since moved to
+**b11429** (commit `d8123504`); only the statements below that name b11429 were
+re-read there. Re-derive the rest rather than trusting it across the move.
+
+**Per-token traffic, derived from the b10375 source.** The attention (KQ) mask
+is `[n_kv, n_tokens]` in F16 with no row padding (upstream removed
+`GGML_KQ_MASK_PAD` in PR #17910), and the head re-sends it on every graph
+compute to every worker that holds full-attention layers. At b11429 RPC devices
+report async and event support, so a layer-split head logs "pipeline
+parallelism enabled" and `ggml_backend_sched` keeps `GGML_SCHED_MAX_COPIES` = 4
+copies of every cross-split input and every graph input per consuming backend —
+one mask copy is 128 MiB at 128k context with a 512-token micro-batch, so up to
+~512 MiB more per worker is possible; the real memory impact is unmeasured, and
+the worker budgets in `k8s/daemonset-shard.yaml` were derived with pipeline
+parallelism off.
+
+- **Decode is dominated by the logits, not the mask.** One decoded token's mask
+  is `n_kv × 2 B` — 256 KiB per worker at a filled 131072 context, about
+  768 KiB per 3-worker group. The larger term is the logits readback from the
+  last worker, 248,320 × 4 B = 993,280 B per token, plus two relayed 8 KiB
+  hidden-state hops. A 3-worker group moves about 1.06 MB per decoded token at
+  4k of filled context, 1.23 MB at 32k and 1.82 MB at 128k, over 3 blocking
+  round trips; seven workers at 128k would be about 2.9 MB.
+- **Prefill is dominated by the mask, quadratically.** Each 512-token
+  micro-batch sends `n_kv × 512 × 2 B` to every worker, up to 128 MiB per worker
+  per micro-batch at 128k. A cold 32k prompt therefore moves about 1 GiB per
+  worker, and a cold 128k prompt about 16 GiB per worker — about 48 GiB per
+  group, roughly 440 s of 1 GbE wire time before the first token.
+
+So the example fleet's two groups of four, rather than one group of eight, rest
+on memory per worker (about 6.9 GiB of weights against about 13 GiB free), two
+independent agents, a worker loss that takes down one group rather than both,
+and prefill mask traffic that is linear in worker count — not on decode
+traffic. `context_size: 32768` is the fallback when long-prompt prefill time is
+the problem; measure with `ifstat` on a head during a long prefill before
+trusting 128k prompts.
+
+**The worker tensor cache is content-addressed.** `rpc-server -c` stores every
+tensor over 10 MiB that it is sent under `$LLAMA_CACHE/rpc/`, in a file named by
+the FNV-1a-64 hash of the tensor's raw bytes — independent of tensor name,
+worker or split. Three consequences:
+
+- **Worker weights do live on local disk**, in the `/opt/aureax/rpc-cache`
+  hostPath (`model.rpc_server.cache_dir`), even though no model file is ever
+  pushed to a worker.
+- **Nothing invalidates it.** A plain worker or head restart is a warm load.
+  Resizing or reordering a group moves layer ranges, and a worker whose range
+  moved simply misses the tensors it never received — a *partial* cold load. A
+  fully cold load is a fresh node or a wiped cache. A reorder is still refused
+  at generate, for the device-renumbering reason in the table above.
+- **A hazard of the previous pin, fixed at this one:** at b10375 the cache also
+  wrote every *runtime* tensor over 10 MiB, which includes each prefill
+  micro-batch's mask once `n_kv` exceeds 10240 tokens — about 1 GiB per worker
+  per 32k prompt and 16 GiB per 128k prompt, never deleted. Upstream fixed it in
+  PR #28789 (first build b10985), so at b11429 the cache holds weights only, and
+  the worker supervisor's cache-hygiene step is now a backstop that clears the
+  mask files an older image left behind.
+
+**Seeding the cache offline: `scripts/seed-rpc-cache.py`.** Because the key
+depends on content alone, the cache files can be produced from the GGUF without
+a running group, turning a fresh node's first load into a warm one.
+`orchestrator/config/gguf.py` (standard library only, no `orchestrator`
+imports) reads the header the way `gguf.cpp` does at b10375 — v2/v3, the data
+section at the first multiple of `general.alignment` (default 32) after the
+header, tensors packed in header order at padded offsets — and llama.cpp's
+loader sends each tensor bound for an RPC buffer whole, from offset 0, so a
+tensor's key is the FNV-1a-64 of the file range `[data_offset + offset,
++ nbytes)`. `manifest <gguf> [--hash]` lists every tensor strictly over 10 MiB
+in `<gguf>.rpc-manifest.json`: `gguf`, `size_bytes`, `sha_note`, `threshold`
+(10485760) and `entries` of `{name, offset, nbytes, hash}`, with `offset`
+absolute in the file and `hash` the 16-hex key or `null`. The list is
+placement-agnostic — it includes whatever the head keeps on its own CPU, the
+token embedding typically — and a split GGUF takes one manifest per part.
+`export` writes `DIR/<key>` through `.<key>.tmp`, fsync and rename, and
+re-hashes every file before it gets its name: rpc-server trusts the name, so a
+file whose bytes do not hash to it would load as the wrong weights without a
+word, which is exactly what a same-layout re-upload of a GGUF would otherwise
+produce. `verify` sorts a cache directory into ok, *mismatched* (a known key at
+the wrong size: rpc-server writes with a plain `ofstream`, so an interrupted
+write leaves a short file under the right name, and it loads whatever is
+there) and *unknown* (a key the manifest does not list, such as the masks
+above), and exits 1 while either remains. Hashing is byte-serial, so a
+~40-line C helper is compiled into `~/.aureax/bin/fnv1a64` when `cc` exists
+(about 1 GB/s) and checked against the Python reference before every use; pure
+Python, at about 15 MB/s, is the fallback and gives the same keys.
+
 ### Security
 
 `rpc-server` is the **only unauthenticated door left on a node, and the only
@@ -932,6 +1027,15 @@ serves. Four properties are worth knowing:
   port. Removing the `INPUT` jump and the chain is safe only once every RPC
   process on that port has stopped, and a firewall manager that flushes them
   while workers run undoes the whole control.
+**A group can put this door behind an authenticated tunnel.** With
+`node_groups[].wireguard.enabled`, each worker's rpc-server binds only its
+WireGuard address, and the chain above narrows to accept the head only as it
+arrives on `wg0` from the head's tunnel address — a packet WireGuard has
+authenticated against the head's key. The control is then the tunnel, with the
+firewall as a second layer rather than the only one; the port is still plaintext
+and unauthenticated inside it. A group that does not enable it keeps exactly the
+policy described above. The design, its cost and the procedures are in
+**WireGuard transport for rpc-server** below.
 
 Everything else on a node carries both: HTTPS with a leaf the fleet CA
 signed (§2, **TLS**), plus a per-node bearer key on `:8080`/`:30800` and on
@@ -966,6 +1070,138 @@ One consequence of proving auth rather than assuming it: the Access tab's live
 probes deliberately send an unauthenticated request first, so while the tab is
 open each node logs roughly one rejected llama request per minute and one
 rejected MCP request per 20-second poll. Expected noise, not a fault.
+
+### WireGuard transport for rpc-server
+
+`rpc-server` binds one address, serves one client and speaks plain TCP with no
+authentication — properties of the protocol at the pinned build, not settings.
+On the LAN its only control is the host firewall above, which trusts a *source
+address*: anything that can present the head's LAN address reaches the port, and
+weights and activations cross the wire in clear. A node group can opt into a
+kernel WireGuard **star** instead — the head is the hub, every worker a spoke —
+which is all the topology RPC needs, because every RPC byte flows head↔worker
+(workers never talk to each other; the head relays hidden states between them).
+
+```yaml
+node_groups:
+  - name: qwen35b-a
+    ...
+    wireguard:
+      enabled: true              # default false
+      subnet: "10.254.0.0/24"    # default 10.254.<group index>.0/24
+      listen_port: 51820         # UDP, on the head; workers dial it
+      mtu: 1420
+      persistent_keepalive: 25   # seconds, >= 1
+```
+
+**Addressing.** The head is `network + 1` and the workers `network + 2` onward in
+`workers:` order — the `--rpc` order — so appending a worker gives it the next
+address and moves nobody else. The subnet must be IPv4 and a /24 or larger, two
+*enabled* groups may not overlap, and a subnet holding any target's own LAN
+address is refused (wg-quick would route that LAN traffic into the tunnel). The
+default `10.254.<index>.0/24` stays clear of K3s's pod (10.42/16) and service
+(10.43/16) ranges; it follows the group's position in `node_groups`, so pin
+`subnet:` before reordering groups. The interface is always `wg0`
+(`schema.WG_INTERFACE`): a node that already runs an unrelated `wg0` would have
+its `/etc/wireguard/wg0.conf` replaced. K3s's own `wireguard-native` flannel
+backend also listens on UDP 51820 — move `listen_port` if a cluster uses it.
+
+**What enabling it changes, and the only things it changes.**
+
+- **Keys.** `aureax generate` mints an X25519 pair per member into
+  `~/.aureax/wireguard/` (`orchestrator/config/wgstore.py`: `<node>.key` 0600,
+  `<node>.pub` 0644, base64 of the raw 32 bytes — exactly what `wg genkey` /
+  `wg pubkey` print), before any config is resolved, like the MCP keys. Nothing
+  else ever mints one; `aureax wg status` reads, `aureax wg regenerate` rotates.
+- **Configs.** Every member's resolved config is stamped with
+  `node.wireguard: {interface: wg0, address: <addr>/<prefix>}` (assigned like
+  `tls:`, removed from any node outside an enabled group), the head's
+  `${rpc_servers}` resolves to the workers' tunnel addresses, and each worker's
+  `model.rpc_server.allowed_clients` becomes the head's tunnel address **and
+  nothing else** — an allowlisted LAN address would be a second way in that
+  WireGuard never authenticated. `validate_groups` refuses a worker template with
+  a literal `rpc_server.host`, since only `host: auto` resolves to the tunnel.
+- **The worker.** `resolve_rpc_host` binds the stamped address. The
+  `rpc-firewall` init container first waits (up to 180 s, by binding a throwaway
+  socket to that address) for wg-quick to have configured it — after a reboot
+  the kubelet can start the pod first — then installs `lo` ACCEPT, the node's own
+  address ACCEPT, `-i wg0 -s <head tunnel address>` ACCEPT, DROP. There is no
+  UDP rule: the chain only ever sees TCP to the RPC port, and the worker needs no
+  inbound one anyway, since it initiates to the head with a keepalive and the
+  head's packets are replies.
+- **The shard pod's startupProbe** is an `exec` of `client/rpc_probe.py`, which
+  dials what `resolve_rpc_host` says rpc-server binds. A `tcpSocket` probe can
+  only dial the pod IP — the LAN address — and would be refused for the whole
+  budget on a tunnel-bound worker. On a LAN-bound worker it dials the same
+  address the `tcpSocket` probe did; because it changes the DaemonSet template,
+  the first `kubectl apply` of the manifest replaces every worker pod once.
+- **The push.** `Deployer.deploy_configs` renders each member's `wg0.conf`
+  (`templating.render_wg_config`: private key inline, as wg-quick requires;
+  `Address`, `ListenPort`, `MTU`; on the head one `[Peer]` per worker with its
+  /32 and **no Endpoint**, on a worker one `[Peer]` for the head with its LAN
+  address — resolved to a literal on the orchestrator — and the keepalive). It
+  rides the same connection and the same sudo chain as the four mandatory files,
+  staged 0600 like `node.key` and installed root:root 0600 in a 0700
+  `/etc/wireguard`, after a preflight that refuses by name a node with no
+  `wg-quick` or no `wireguard` module before anything moves. Then
+  `systemctl enable --now wg-quick@wg0`, and `restart` only when `cmp` found the
+  installed file different, because a restart drops every RPC connection riding
+  the tunnel. The rendered file has no timestamp for the same reason.
+- **Diagnostics.** `aureax wg status` lists each enabled group's subnet and every
+  member's address, public key and key file; `aureax group list` names the tunnel
+  addresses the head dials; `aureax group doctor` counts a head attached to its
+  workers' tunnel addresses as attached.
+
+A fleet that never enables it generates byte-identical configs and runs
+byte-identical install commands (`test_node_groups.py::test_a_fleet_without_wireguard_generates_exactly_what_it_did_before`,
+`test_deployer.py::test_a_fleet_without_wireguard_runs_the_exact_install_command_it_always_ran`),
+and a member of an enabled group runs that same command with the tunnel spliced
+in (`…::test_a_wireguard_member_gets_its_wg0_conf_in_the_same_push`).
+Provisioning installs `wireguard-tools` (with `--no-install-recommends`, which
+keeps `wireguard-dkms` off a kernel that already has the module) and checks
+`modprobe wireguard` on every node — `setup-all.sh` Step 2c and `join-node.sh` —
+so turning the tunnel on later needs nothing provisioned first.
+
+**Procedures.** Every one ends in `aureax stop && aureax start`, because `apply`
+never restarts a shard worker: until its pod is recreated a worker keeps the
+bind address and firewall it started with, and its rpc-server — one client at a
+time — may still hold the old head's connection, whose FIN never crossed a
+tunnel that was bouncing at the time.
+
+- *Enable:* set `wireguard.enabled: true`, then `aureax generate
+  --orchestrator-ip <ip>`, `aureax apply --all --orchestrator-ip <ip>` (installs
+  and starts the tunnel, restarts the head, which now dials the tunnel), then
+  `aureax stop && aureax start`. Between the apply and the restart the head
+  cannot reach its workers — they still listen on the LAN, behind a chain that
+  drops the tunnel — and waits out its peer timeout.
+- *Rotate a key:* `aureax wg regenerate --node <id>` (keeps one `.key.prev`),
+  `aureax apply --node <id> --orchestrator-ip <ip>` — which already pushes to the
+  whole group, and every peer carries the rotated public key — then
+  `aureax stop && aureax start`.
+- *Disable:* set it back to `false` and run the same three steps. The tunnel
+  stays up on the nodes, inert: nothing binds to it and no rule refers to it.
+
+**Cost, and the measurement gate before enabling it fleet-wide.** Derived from
+the RPC source at the pin and from published figures, not yet measured on this
+fleet. A decoded token moves about 1 MB over 3 blocking round trips (§3, "LAN
+traffic and the worker tensor cache"). WireGuard on RK3588-class boards sustains
+about 3.2 Gbps, so at 1 GbE the cipher is not the bottleneck and the cost is
+framing: at MTU 1420 bulk goodput falls from about 941 to 889 Mbps (~5%), and a
+decoded token gains about 0.5 ms. The gate is to re-run `scripts/bench-decode.sh`
+against one group's head with the tunnel off and on (same `N_PREDICT`, `RUNS`,
+`PREFILL_TOKENS`; `HEAD_SSH` set — `HEAD_NIC` unset counts the physical NIC,
+WireGuard framing included, `HEAD_NIC=wg0` the payload), expect about +0.5 ms per
+token and ~5% lower prefill goodput, and watch A76 utilisation on the head and
+workers while it runs: kernel WireGuard spreads its crypto over every core,
+including the ones `node.cpu_affinity` pins ggml's busy-spinning threads to. A
+result well outside those bounds is a reason to stop and look before enabling a
+second group.
+
+**What it does not do.** The tunnel authenticates the head's *key*, not the RPC
+protocol: whoever holds a head's private key — or root on the head — still
+reaches every worker in its group, which is the head's existing privilege. The
+head's UDP port is open to the LAN, where WireGuard answers nothing to a packet
+it cannot authenticate.
 
 ---
 
@@ -1118,8 +1354,10 @@ re-measure rather than trusting the values.
 Two things fall out of that table:
 
 - **Cold load is flat in peer count**, because the head ships the same total
-  bytes either way. Resizing a group invalidates every worker's tensor cache, so
-  the first start after a resize is always a cold one.
+  bytes either way. "Cold" means the workers' tensor caches do not hold what
+  they are sent — a fresh node or a wiped cache. The cache is content-addressed
+  (§3, **LAN traffic and the worker tensor cache**), so a restart reloads warm
+  and a resize is only a partial cold load.
 - **The `~17 s/GB` planning heuristic** quoted in the config comments comes from
   the 15.7 GB / 272 s point and **overestimates at larger sizes**: it predicts
   ~1220 s for the 71.7 GB model, which actually loaded in ~947 s (~13 s/GB).
@@ -1128,6 +1366,11 @@ Two things fall out of that table:
   first success, so overshooting costs nothing and undershooting crash-loops.
   `tests/test_shard_budgets.py` encodes that heuristic as the floor every
   `EDGE_WAIT` has to clear, for the deployed models and the rollback alike.
+  The heuristic also predates the understanding that the tensor cache is
+  content-addressed, so the bench did not separate a fully cold load from the
+  partial one a resize causes, and a point taken as "the first start after a
+  resize" may have been partly warm. Re-measure against a wiped
+  `/opt/aureax/rpc-cache` before relying on it at a new size.
 
 Per-worker memory figures are deliberately not in this table: the worker
 footprint is not one multiplier over the mean (see **Invariants and how each is

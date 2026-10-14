@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from typing import Any, Literal
@@ -67,6 +68,55 @@ DEFAULT_WORKER_WAIT_SECONDS = 300
 # time on the node than the orchestrator's probe-budget test assumes. Declared
 # here (this file ships in the edge image) so client/entrypoint.py imports it.
 DEFAULT_HEALTH_TIMEOUT_SECONDS = 120
+# ============================================================================
+# WireGuard transport for rpc-server (opt-in per node group)
+# ============================================================================
+# The interface every group member's tunnel is called. One literal shared by
+# the stamped `node.wireguard.interface`, the deployer's /etc/wireguard/<it>.conf
+# and wg-quick@<it> unit, and the worker firewall's `-i` scope, so the four
+# cannot name different devices. A node that already runs an unrelated `wg0`
+# would have that file replaced by `aureax apply`; nodes here are dedicated
+# appliances, and renaming the tunnel means changing this one value.
+WG_INTERFACE = "wg0"
+
+# When a group enables WireGuard without naming `subnet:`, group N (its
+# position in node_groups) gets 10.254.N.0/24. Chosen to stay clear of the
+# K3s defaults (pod 10.42.0.0/16, service 10.43.0.0/16) and of the usual LAN
+# ranges; NetworkConfig refuses a subnet that holds a target's own address.
+# Pin `subnet:` explicitly before reordering node_groups, or every member's
+# tunnel address moves with the reorder.
+WG_DEFAULT_SUBNET_TEMPLATE = "10.254.{index}.0/24"
+WG_DEFAULT_LISTEN_PORT = 51820
+WG_DEFAULT_MTU = 1420
+WG_DEFAULT_KEEPALIVE_SECONDS = 25
+
+# Linux network interface names: at most 15 bytes (IFNAMSIZ - 1), no '/' and
+# no whitespace. Narrower than the kernel allows on purpose — the name reaches
+# a systemd unit name, a file path and an iptables argument.
+_IFACE_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,15}")
+
+
+def wg_default_subnet(index: int) -> str:
+    """The subnet a WireGuard group at position ``index`` gets by default."""
+    if not 0 <= index <= 255:
+        raise ValueError(
+            f"node_groups[{index}]: only the first 256 groups have a default WireGuard "
+            "subnet — set `wireguard.subnet` explicitly"
+        )
+    return WG_DEFAULT_SUBNET_TEMPLATE.format(index=index)
+
+# The sampler names llama.cpp's --samplers accepts at the pinned build (b11429,
+# unchanged since b10375; common/sampling.cpp::common_sampler_types_from_names).
+# LlamaServerConfig refuses any other name because llama-server does NOT: an
+# unknown name is only warned about and DROPPED, so a typo would start cleanly
+# and silently run a different chain than the config says. The ones that ALSO
+# have a backend implementation — the set that
+# makes `backend_sampling` actually remove the per-token logits readback — are
+# penalties, top_k, top_p, min_p and temperature; see that field's comment.
+LLAMA_SAMPLER_NAMES: frozenset[str] = frozenset({
+    "dry", "top_k", "top_p", "top_n_sigma", "typ_p", "min_p", "temperature",
+    "xtc", "infill", "penalties", "adaptive_p",
+})
 
 # ============================================================================
 # llama.cpp build floor
@@ -74,12 +124,15 @@ DEFAULT_HEALTH_TIMEOUT_SECONDS = 120
 # Minimum llama.cpp build this fleet may run. b8492 fixed CVE-2026-34159 (an
 # unauthenticated RCE in rpc-server's tensor-graph deserialization, CVSS 9.8,
 # with a public 0-click exploit), and further server-side memory-corruption
-# fixes landed through b9060. Both Dockerfiles pin LLAMA_CPP_VERSION=b10375
-# (docker/Dockerfile.client and docker/Dockerfile.client.cuda), which is
-# above every fixed-in build known as of 2026-08 — the floor makes a rollback
-# to an older build a visible security decision instead of an accident.
-# `aureax group doctor` warns when a member reports a build below it.
-MIN_LLAMA_BUILD = 10375
+# fixes landed through b9060. The floor was raised from 10375 (the previous
+# pin) to 11000 for the upstream #24292 RCE fix, so a node still on the old
+# pin counts as below it. Both Dockerfiles pin LLAMA_CPP_VERSION=b11429
+# (docker/Dockerfile.client and docker/Dockerfile.client.cuda), which clears
+# it — the floor makes a rollback to an older build a visible security
+# decision instead of an accident. `aureax group doctor` warns when a member
+# reports a build below it, so every node still running a b10375 image warns
+# until it is rebuilt.
+MIN_LLAMA_BUILD = 11000
 
 _BUILD_TAG_RE = re.compile(r"\bb(\d{3,})\b")
 
@@ -487,6 +540,67 @@ class KubernetesConfig(BaseModel):
     shard_label_value: str = "worker"
 
 
+class WireGuardGroup(BaseModel):
+    """Carry a group's rpc-server traffic over a WireGuard star instead of the LAN.
+
+    rpc-server speaks plain TCP with no authentication at any layer, so on its
+    own the host firewall is the whole control. With this on, the head is the
+    hub and every worker a spoke: each worker's rpc-server binds its tunnel
+    address only, its firewall accepts the head's TUNNEL address only and only
+    on the tunnel interface, and WireGuard's cryptokey routing means a packet
+    from that address has been authenticated by the head's key. Off by default
+    — a fleet that never sets it generates and deploys exactly what it did
+    before. See ARCHITECTURE.md, "WireGuard transport for rpc-server".
+    """
+
+    enabled: bool = False
+    # IPv4 CIDR, /24 or larger. None means 10.254.<group index>.0/24
+    # (WG_DEFAULT_SUBNET_TEMPLATE). Must not overlap the fleet LAN: a target
+    # whose own address falls inside it is refused, because wg-quick would route
+    # that node's LAN traffic into the tunnel.
+    subnet: str | None = None
+    # UDP. Only the head's port is ever dialled — workers initiate, so their
+    # Endpoint is the head's physical address and this port.
+    listen_port: int = WG_DEFAULT_LISTEN_PORT
+    # 1420 is wg-quick's own default for an IPv4 underlay: 1500 minus the 80
+    # bytes of outer IPv6 + UDP + WireGuard framing it budgets for.
+    mtu: int = WG_DEFAULT_MTU
+    # Seconds between a worker's keepalives to the head. Never 0 here: the head
+    # carries no Endpoint for its workers and learns each one from the worker's
+    # own packets, so a worker that never speaks first is unreachable — the head
+    # would wait out worker_wait_timeout_seconds on a peer it cannot address.
+    persistent_keepalive: int = WG_DEFAULT_KEEPALIVE_SECONDS
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> WireGuardGroup:
+        if self.subnet is not None:
+            try:
+                net = ipaddress.ip_network(self.subnet, strict=True)
+            except ValueError as e:
+                raise ValueError(
+                    f"wireguard.subnet {self.subnet!r} is not a network address in CIDR form "
+                    f"(e.g. 10.254.0.0/24): {e}"
+                ) from None
+            if net.version != 4:
+                raise ValueError(f"wireguard.subnet {self.subnet!r} must be IPv4")
+            if net.prefixlen > 24:
+                raise ValueError(
+                    f"wireguard.subnet {self.subnet!r} must be a /24 or larger — members are "
+                    "numbered head = network + 1, workers = network + 2 onward"
+                )
+        if not 1 <= self.listen_port <= 65535:
+            raise ValueError(f"wireguard.listen_port {self.listen_port} is not a UDP port")
+        if not 576 <= self.mtu <= 65535:
+            raise ValueError(f"wireguard.mtu {self.mtu} is outside 576..65535")
+        if not 1 <= self.persistent_keepalive <= 65535:
+            raise ValueError(
+                f"wireguard.persistent_keepalive {self.persistent_keepalive} must be 1..65535 "
+                "seconds — the head has no Endpoint for its workers and learns each one from "
+                "the worker's keepalives, so 0 leaves every worker unreachable"
+            )
+        return self
+
+
 class NodeGroup(BaseModel):
     """A set of nodes that cooperatively serve ONE model via llama.cpp RPC.
 
@@ -518,10 +632,67 @@ class NodeGroup(BaseModel):
     # llama-server. Without workers up, llama-server exits immediately.
     worker_wait_timeout_seconds: int = DEFAULT_WORKER_WAIT_SECONDS
 
+    # --- placement --------------------------------------------------------------
+    # How many of the model's first layers stay on the HEAD's own CPU instead of
+    # going to the workers. 0 (the default) is the layout every group has run so
+    # far: the head keeps only the token embedding, sampling, HTTP and MCP, and
+    # its cores idle while the workers compute in turn. A positive count turns
+    # the head into a fourth compute stage: on the current 35B groups 10 layers
+    # take about 4.9 GiB of weights plus 0.5 GiB of KV onto the head, drop the
+    # heaviest worker from about 7.9 to 6.1 GiB, leave decode latency unchanged
+    # to first order (every stage still runs in sequence), and speed prefill up
+    # because only the head's own CPU buffers get llama.cpp's repacked ARM
+    # kernels (an rpc-server never does). The numbers are derived, not measured;
+    # ARCHITECTURE.md "Sharded model groups" has the arithmetic and the gates.
+    #
+    # Resolved through the `${gpu_layers}` and `${tensor_split}` placeholders
+    # (orchestrator/config/placement.py), which a head template must use for
+    # any non-zero value — a literal split cannot follow a changed layer range.
+    # Needs the model's layer count: from the GGUF in models/, or the registry
+    # entry's `layers:` hint when the file is not on this machine.
+    head_layers: int = 0
+
+    # How the offloaded layers are shared out. "even" is llama.cpp's own even
+    # split written as slot counts — for head_layers 0 it is exactly the
+    # `[1, 1, 1]` the templates have always carried, so the default changes
+    # nothing. "balanced" reads per-layer byte sizes and KV-cache layers from
+    # the GGUF header (models/ on this machine) and minimises the heaviest
+    # device's weights-plus-KV footprint over all contiguous partitions; it is
+    # what an uneven fleet or a tight memory budget wants, and it needs the file.
+    placement: Literal["even", "balanced"] = "even"
+
+    # Opt-in WireGuard star for this group's RPC traffic; see WireGuardGroup.
+    wireguard: WireGuardGroup = Field(default_factory=WireGuardGroup)
+
+    @model_validator(mode="after")
+    def _check_head_layers(self) -> NodeGroup:
+        if self.head_layers < 0:
+            raise ValueError(f"group {self.name!r}: head_layers must be 0 or more")
+        return self
+
     @property
     def members(self) -> list[str]:
         """Head first, then workers — the order `tensor_split` is written in."""
         return [self.head, *self.workers]
+
+    def wg_network(self, index: int) -> ipaddress.IPv4Network:
+        """This group's tunnel subnet, given its position in ``node_groups``.
+
+        The configured ``wireguard.subnet``, else the index-derived default.
+        Answers whether or not the group has WireGuard enabled; callers that
+        must not act on a disabled group ask ``NetworkConfig.wireguard_addresses``.
+        """
+        return ipaddress.IPv4Network(self.wireguard.subnet or wg_default_subnet(index))
+
+    def wg_addresses(self, index: int) -> dict[str, str]:
+        """node_id -> tunnel address (no prefix length), head first.
+
+        Head = network + 1, workers = network + 2 onward in ``workers:`` order —
+        the same order as --rpc, so appending a worker gives it the next free
+        address and leaves every existing member's address where it was.
+        """
+        base = self.wg_network(index).network_address
+        return {node_id: str(base + 1 + i) for i, node_id in enumerate(self.members)}
 
     def rpc_endpoints(self, host_by_node_id: dict[str, str]) -> list[str]:
         """`host:port` for each worker, in --rpc order.
@@ -605,6 +776,12 @@ class ModelRegistryEntry(BaseModel):
     # behind a URL can change between two provisions of the same fleet, which is
     # exactly what a declared digest then reports as a mismatch.
     revision: str | None = None
+    # The model's transformer block count (GGUF `<arch>.block_count`). Only a
+    # hint: placement reads the real header whenever the GGUF is in models/,
+    # and needs this only when it is not — a head_layers > 0 group generated
+    # on a machine without the file. tests/test_shard_budgets.py uses it the
+    # same way. Leave it unset for a model whose placement is the default.
+    layers: int | None = None
 
     @model_validator(mode="after")
     def _check_digests(self) -> ModelRegistryEntry:
@@ -882,6 +1059,66 @@ class NetworkConfig(BaseModel):
 
         return self
 
+    @model_validator(mode="after")
+    def _check_wireguard(self) -> NetworkConfig:
+        """Tunnel subnets must be usable, distinct, and off the fleet LAN.
+
+        Runs after _check_node_groups, so membership is already sound. Only
+        groups that enable WireGuard are checked against each other: a disabled
+        group's subnet is never configured anywhere.
+        """
+        enabled: list[tuple[NodeGroup, ipaddress.IPv4Network]] = []
+        for index, group in enumerate(self.node_groups):
+            if not group.wireguard.enabled:
+                continue
+            try:
+                net = group.wg_network(index)
+            except ValueError as e:
+                raise ValueError(f"node_group {group.name!r}: {e}") from None
+            if net.num_addresses - 2 < len(group.members):
+                raise ValueError(
+                    f"node_group {group.name!r}: wireguard subnet {net} has room for "
+                    f"{net.num_addresses - 2} addresses but the group has {len(group.members)} members"
+                )
+            for other, other_net in enabled:
+                if net.overlaps(other_net):
+                    raise ValueError(
+                        f"node_groups {other.name!r} and {group.name!r} both use WireGuard "
+                        f"subnets that overlap ({other_net} and {net}) — two hubs would claim "
+                        "the same tunnel addresses. Give each group its own `wireguard.subnet`."
+                    )
+            for target in self.ssh.targets:
+                try:
+                    addr = ipaddress.ip_address(target.host)
+                except ValueError:
+                    continue  # a hostname; nothing to compare without resolving it
+                if addr in net:
+                    raise ValueError(
+                        f"node_group {group.name!r}: wireguard subnet {net} contains "
+                        f"{target.node_id}'s own address {target.host} — wg-quick would route "
+                        "that LAN traffic into the tunnel. Pick a subnet that does not overlap "
+                        "the fleet LAN."
+                    )
+            enabled.append((group, net))
+        return self
+
+    def wireguard_addresses(self, group: NodeGroup) -> dict[str, str] | None:
+        """node_id -> tunnel address for a group that has WireGuard ENABLED, else None.
+
+        The one question every generator and the CLI ask, so "is the tunnel on
+        for this group" has a single answer. The group's index is its position
+        in ``node_groups``, which is what the default subnet is derived from.
+        """
+        if not group.wireguard.enabled:
+            return None
+        return group.wg_addresses(self.node_groups.index(group))
+
+    def wireguard_network(self, group: NodeGroup) -> ipaddress.IPv4Network | None:
+        """The tunnel subnet of a group that has WireGuard ENABLED, else None."""
+        if not group.wireguard.enabled:
+            return None
+        return group.wg_network(self.node_groups.index(group))
+
     def group_for_node(self, node_id: str) -> NodeGroup | None:
         """The group `node_id` belongs to, or None if it is standalone."""
         for group in self.node_groups:
@@ -897,6 +1134,43 @@ class NetworkConfig(BaseModel):
 # ============================================================================
 # aureax-edge.yaml schema
 # ============================================================================
+
+
+class NodeWireGuard(BaseModel):
+    """This node's end of its group's WireGuard tunnel. Stamped, never authored.
+
+    templating.generate_edge_config writes this block into every member of a
+    group that has ``wireguard.enabled`` and removes it from every other node,
+    the way it stamps ``tls:`` — so a template cannot forget it or carry a stale
+    one. Two readers on the node: client/config/parser.py::resolve_rpc_host
+    binds rpc-server to ``address`` (without the prefix length), and
+    client/rpc_firewall.py scopes the head's ACCEPT to ``interface``.
+    """
+
+    interface: str = WG_INTERFACE
+    # Interface address WITH its prefix length, exactly as wg-quick's Address=.
+    address: str
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> NodeWireGuard:
+        if not _IFACE_NAME_RE.fullmatch(self.interface or ""):
+            raise ValueError(
+                f"node.wireguard.interface {self.interface!r} is not a usable interface name "
+                "(1-15 of letters, digits, '_', '.', '-')"
+            )
+        try:
+            iface = ipaddress.ip_interface(self.address)
+        except ValueError:
+            raise ValueError(
+                f"node.wireguard.address {self.address!r} must be an IPv4 address with its "
+                "prefix length, e.g. 10.254.0.2/24"
+            ) from None
+        if iface.version != 4 or "/" not in self.address:
+            raise ValueError(
+                f"node.wireguard.address {self.address!r} must be an IPv4 address with its "
+                "prefix length, e.g. 10.254.0.2/24"
+            )
+        return self
 
 
 class NodeConfig(BaseModel):
@@ -940,6 +1214,11 @@ class NodeConfig(BaseModel):
     # peers it can never reach — with no error, because from its side it is
     # simply still loading. Needs hostPID on the DaemonSet to see the orphan.
     reap_stale_children: bool = True
+
+    # Present only on members of a group with `wireguard.enabled`; stamped by
+    # the generator (see NodeWireGuard). None everywhere else, which is every
+    # node of a fleet that never enables the tunnel.
+    wireguard: NodeWireGuard | None = None
 
 
 class LlamaServerConfig(BaseModel):
@@ -999,10 +1278,11 @@ class LlamaServerConfig(BaseModel):
     # The key reaches llama-server via the LLAMA_API_KEY environment variable
     # set by the supervisor — NEVER as --api-key argv, which would be visible
     # in `ps` on a hostPID node and echoed into shipped logs. With a key set,
-    # /health, /v1/health, /models, /v1/models and the web-UI assets stay
-    # public on the pinned build (b10375; upstream removed the two /models
-    # exemptions right after it), while /metrics, /props, /slots, /completion
-    # and all /v1/* inference routes require `Authorization: Bearer <key>`.
+    # only /health, /v1/health, / and the embedded web-UI assets stay public
+    # on the pinned build (b11429), and OPTIONS requests skip auth; /models
+    # and /v1/models need the key from b10518 on (upstream #26347 removed
+    # their exemption), as do /metrics, /props, /slots, /completion and all
+    # /v1/* inference routes — `Authorization: Bearer <key>`.
     api_key: str | None = None
 
     # --- HTTP surface hardening --------------------------------------------
@@ -1028,22 +1308,69 @@ class LlamaServerConfig(BaseModel):
 
     # --alias: the model id reported by /v1/models and /props. Unset, llama
     # reports the GGUF file path, which harnesses (aider, Continue, Open WebUI)
-    # then require users to type verbatim. No commas: b10375 parses --alias as
-    # a comma-separated LIST of aliases.
+    # then require users to type verbatim. No commas: the pinned build parses
+    # --alias as a comma-separated LIST of aliases.
     alias: str | None = None
 
-    # --backend-sampling keeps sampling on the compute device and returns a
-    # token id instead of the full logits vector. The raw-logits path returns
-    # one float per vocabulary entry per decoded token, over a blocking RPC
-    # round trip — 993 KB per token at a 248,320-entry vocabulary, which is the
-    # size the example fleet's models use. Scale that figure by the vocabulary
-    # of whatever model this node actually serves.
+    # --backend-sampling moves the SAMPLER CHAIN onto the device that holds the
+    # output tensor. On its own it does NOT remove the per-token logits
+    # readback: llama.cpp runs on the backend only the longest PREFIX of the
+    # chain whose samplers implement backend_init, and llama-server's default
+    # chain begins `penalties, dry, ...` where `dry` has no backend
+    # implementation — so the prefix ends after `penalties`, which hands back a
+    # full-vocabulary tensor (248,320 x 4 B = 993,280 B per token at this
+    # fleet's vocabulary) that the context copies to the host over a blocking
+    # RPC GET exactly as the raw-logits path would. Pair it with `samplers`
+    # below, restricted to backend-capable samplers, and the readback shrinks
+    # to the sampled token plus its top-k probabilities. (Derived from the
+    # llama.cpp source at b10375 — common/sampling.cpp and
+    # src/llama-sampler.cpp — and the sampler table, default chain and
+    # backend_init coverage are unchanged at the pinned build b11429; measure
+    # it on the fleet with
+    # scripts/bench-decode.sh and HEAD_SSH set.)
     #
-    # Off by default (upstream marks it experimental), and note it disables
-    # ITSELF for any request carrying tools or a json_schema — which, with
-    # jinja on, is most structured requests. Treat it as a small win on plain
-    # chat, not a guaranteed one.
+    # Off by default (upstream marks it experimental). It disables itself per
+    # request for anything carrying a grammar — tools or a json_schema, which
+    # `jinja: true` makes common — and for n_probs > 0, so treat it as a win on
+    # plain completion and MCP run_inference calls, not a universal one.
     backend_sampling: bool = False
+
+    # --samplers: the sampler chain, in order, joined with ';' on the command
+    # line. None or empty = flag omitted = llama-server's default chain. Names
+    # are llama.cpp's own (LLAMA_SAMPLER_NAMES, from common/sampling.cpp at
+    # the pinned build); anything else is refused here because llama-server
+    # would NOT refuse it — an unknown name is warned about and dropped, and
+    # the node silently runs a different chain from the one configured.
+    #
+    # The reason to set it at all is backend_sampling above: of the default
+    # chain only penalties, top_k, top_p, min_p and temperature (plus the
+    # implicit final dist) have backend implementations at the pinned build;
+    # dry, top_n_sigma, typ_p, xtc, infill and adaptive_p do not, and one of
+    # them anywhere in the chain pulls everything after it back to the host.
+    # A client can still override the chain per request through the API's
+    # `samplers` field — that request simply pays the full readback.
+    samplers: list[str] | None = None
+
+    # --cache-ram (MiB): llama-server's prompt cache for DISPLACED slots. None
+    # = flag omitted = llama.cpp's own default of 8192 MiB. Set it to 0 on a
+    # sharded head, and leave it there on the pinned build: saving a slot's
+    # prompt state pulls the whole KV cache and recurrent state back from the
+    # RPC workers, which (a) is head memory the pod limit never budgeted
+    # (about 20 KiB per cached token plus ~63 MiB per cached sequence on the
+    # current model, bounded only by this value) and (b) ABORTED llama-server
+    # over RPC at b10375 — upstream issue #26529: the first request large
+    # enough to trigger a save killed the server; `--cache-ram 0` is the
+    # documented workaround, the issue was closed not-planned, and whether
+    # b11429 still aborts is unconfirmed, so the 0 stays.
+    cache_ram_mib: int | None = None
+
+    # --ctx-checkpoints: how many context checkpoints llama-server keeps PER
+    # SLOT so a later request that shares a prefix can resume without a full
+    # re-prefill. None = flag omitted = llama.cpp's default of 32. They matter
+    # on hybrid (recurrent) models, which cannot reuse a prefix at all without
+    # one, and each costs the sequence's recurrent state in head RAM (~63 MiB
+    # on the current model), so bound them rather than disable them.
+    ctx_checkpoints: int | None = None
 
     # How long to wait for /health after launch. Load time scales with model
     # size and, for a sharded group, with shipping every tensor to the RPC
@@ -1065,6 +1392,13 @@ class LlamaServerConfig(BaseModel):
     rpc_servers: list[str] = Field(default_factory=list)
     devices: list[str] = Field(default_factory=list)
     tensor_split: list[float] = Field(default_factory=list)
+    # Stamped by the generator on a head, never written by hand: how many RPC
+    # devices the group's workers expose in total (a worker exposes one unless
+    # its rpc_server.devices lists more). The head's own topology check
+    # (client/entrypoint.py::_verify_rpc_topology) compares tensor_split
+    # against this rather than against the peer count, which the two differ
+    # from as soon as one worker carries two GPUs. Not an argv input.
+    rpc_device_count: int | None = None
 
     @model_validator(mode="after")
     def _check_server_string_shapes(self) -> LlamaServerConfig:
@@ -1086,6 +1420,20 @@ class LlamaServerConfig(BaseModel):
                 "model.server.alias must not contain commas — llama.cpp parses "
                 "--alias as a comma-separated list of aliases"
             )
+        for name in self.samplers or []:
+            if name not in LLAMA_SAMPLER_NAMES:
+                raise ValueError(
+                    f"model.server.samplers: {name!r} is not a llama.cpp sampler name "
+                    f"(one of {', '.join(sorted(LLAMA_SAMPLER_NAMES))}); llama-server "
+                    "would drop it with only a warning and run a different chain"
+                )
+        if self.cache_ram_mib is not None and self.cache_ram_mib < -1:
+            raise ValueError(
+                "model.server.cache_ram_mib must be -1 (unlimited), 0 (off) or a "
+                "positive MiB count"
+            )
+        if self.ctx_checkpoints is not None and self.ctx_checkpoints < 0:
+            raise ValueError("model.server.ctx_checkpoints must be 0 or more")
         return self
 
 
@@ -1093,10 +1441,21 @@ class DraftModelConfig(BaseModel):
     """Speculative decoding: a small draft model proposing tokens for the target.
 
     SHIPPED DISABLED FLEET-WIDE. Both head templates set `enabled: false`, and
-    configs/aureax-shard-head-35b.yaml's `draft:` block says why in detail: no
-    --spec-draft-c is ever emitted, so the dense draft inherits the head's n_ctx
-    and at context_size 131072 it OOMs the head's pod. Read that block before
-    turning this on.
+    configs/aureax-shard-head-35b.yaml's `draft:` block says why in detail:
+    llama.cpp had no draft context-size flag at b10375 (none confirmed at the
+    current pin, b11429), so a dense
+    draft inherits the head's n_ctx, and at context_size 131072 its KV cache
+    lands on the head's pod with nothing having measured it. Read that block
+    before turning this on.
+
+    Note the history: until the `type` field below existed, the client emitted
+    the --spec-draft-* flags WITHOUT --spec-type, and on the pinned build (as at
+    b10375) that loads the draft model and then creates no speculator at all
+    (common/speculative.cpp: the default type list is {none}). The fleet's
+    earlier "speculation gained
+    nothing" measurement therefore measured a loaded, unused draft — which is
+    also why llama-server logged `loading draft model` and never printed an
+    acceptance statistic. Speculation has not yet run on this fleet.
 
     Why the machinery exists at all: the draft proposes N tokens and the big
     model verifies all N in ONE forward pass, so the target's weights are read
@@ -1118,9 +1477,28 @@ class DraftModelConfig(BaseModel):
 
     enabled: bool = False
 
+    # --spec-type. "draft-simple" is a separate draft GGUF (`filename` below,
+    # runs on the head's own cores). "draft-mtp" is the model's OWN
+    # multi-token-prediction head, which needs no draft file but does need a
+    # GGUF that carries the MTP block (the fleet's current 40-block file does
+    # not; unsloth publishes a 41-block "-MTP" variant). Both names are
+    # llama.cpp's own (common/speculative.cpp at b11429). The flag is emitted
+    # whenever speculation is enabled, because without it llama-server creates
+    # no speculator — see the class docstring.
+    type: Literal["draft-simple", "draft-mtp"] = "draft-simple"
+
     # Resolved against the same `model.local_path` as the target model, and
     # must exist in `model_registry.models` so download-model.sh can fetch it.
+    # Required for draft-simple; ignored by draft-mtp.
     filename: str = ""
+
+    # --spec-draft-device for draft-simple. Empty = emit `none`, which keeps
+    # the draft off every accelerator INCLUDING the RPC workers: llama.cpp
+    # otherwise offers the draft the same device list as the target, and with
+    # the target's layers on RPC devices the draft's weights would cross the
+    # LAN too. `gpu_layers: 0` below already keeps it on the CPU; this makes
+    # the placement explicit rather than inferred.
+    devices: list[str] = Field(default_factory=list)
 
     # --spec-draft-n-max / --spec-draft-n-min. Upstream default for n_max is 3.
     n_max: int = 4
@@ -1149,7 +1527,7 @@ class DraftModelConfig(BaseModel):
         deploys cleanly with speculation configured on and actually off, the
         only symptom being a throughput win that never arrives.
         """
-        if self.enabled and not self.filename.strip():
+        if self.enabled and self.type == "draft-simple" and not self.filename.strip():
             raise ValueError(
                 "model.draft.enabled requires model.draft.filename — llama-server "
                 "gets no --spec-draft-model and speculation is silently off"
@@ -1170,12 +1548,36 @@ class RpcServerConfig(BaseModel):
     host: str = "auto"
     allowed_clients: list[str] = Field(default_factory=list)  # Generated from the group head.
     port: int = DEFAULT_RPC_PORT
+    # -d / --device: which of the node's ggml devices this rpc-server exposes.
+    # Empty = flag omitted = rpc-server's own default, every non-CPU device
+    # the node has, else the CPU. Each exposed device becomes ONE RPC device
+    # on the head, numbered in --rpc order, so a worker with two GPUs and no
+    # list here would take two slots and shift every later worker's number —
+    # which is why validate_groups counts devices, not workers, against the
+    # head's tensor_split. Name one device on a multi-GPU worker.
+    devices: list[str] = Field(default_factory=list)
     threads: int = -1          # -1 → omit the flag, matching parser.py convention
     cache: bool = True         # local tensor cache; avoids re-shipping weights on restart
     cache_dir: str = "/opt/aureax/rpc-cache"
+    # The supervisor refuses to start rpc-server when the cache's filesystem
+    # has less than this much free space (GiB); 0 disables the check. The
+    # cache is on a hostPath that survives restarts, and at b10375 rpc-server
+    # wrote EVERY tensor over 10 MiB it received into it — not only weights
+    # but also prefill attention masks once a prompt passed ~10k tokens (about
+    # 1 GiB per 32k prompt, ~16 GiB per 128k prompt). Fixed upstream in
+    # b10985, so the pinned b11429 caches weights only; mask files an older
+    # image left behind are still there until the audit below clears them. A
+    # full disk there takes the kubelet down with it.
+    # The supervisor's cache audit (client/entrypoint.py::_audit_rpc_cache)
+    # deletes files the manifest does not know; this floor is the backstop.
+    min_free_disk_gib: float = 4.0
     # No memory-advertisement setting: rpc-server in the pinned build accepts
-    # only -h/-t/-d/-H/-p/-c, and an unknown option makes it exit at once. It
-    # advertises real free memory to the head by itself.
+    # only -h/-t/-d/-H/-p/-c, and an unknown option makes it exit at once. What
+    # it reports to the head for a CPU device is total physical RAM as both
+    # "total" and "free" (ggml-cpu's dev_memory at b11429) — not the cgroup
+    # limit and not what is actually unused — which is why an EMPTY
+    # tensor_split, which splits by that figure, cannot see the pod's 11Gi
+    # limit. The explicit split in the head template exists for that reason.
 
 
 class ModelConfig(BaseModel):

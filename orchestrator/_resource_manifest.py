@@ -38,6 +38,7 @@ PUBLIC_RESOURCE_FILES = (
     'scripts/build-on-node.sh',
     'scripts/check-rpc-firewall.py',
     'scripts/download-model.sh',
+    'scripts/seed-rpc-cache.py',
     'scripts/join-node.sh',
     'scripts/lib/common.sh',
     'scripts/parse-config.py',

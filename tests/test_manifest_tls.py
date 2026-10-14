@@ -11,14 +11,14 @@ outside Python entirely — where nothing else reads them:
 
 * **The OpenSSL build.** llama.cpp's ``LLAMA_OPENSSL`` defaults ON but degrades
   to a CMake ``message(WARNING)`` when ``find_package(OpenSSL)`` fails
-  (``vendor/cpp-httplib/CMakeLists.txt`` at b10375), so a builder image without
+  (``vendor/cpp-httplib/CMakeLists.txt`` at b11429), so a builder image without
   ``libssl-dev`` still exits 0 and produces a llama-server that dies with
   "the server is built without SSL support" on the first head that starts. The
   Dockerfiles therefore assert on the artefact with ``ldd``; this module
   asserts the assertion is still there, in both of them, along with the three
   ingredients it checks for.
 
-* **The option's spelling.** There is no ``LLAMA_SERVER_SSL`` at b10375. CMake
+* **The option's spelling.** There is no ``LLAMA_SERVER_SSL`` at b11429. CMake
   reports a misspelt ``-D`` as an unused cache variable and succeeds, so that
   typo is invisible until the fleet crash-loops.
 
@@ -69,10 +69,10 @@ def _containers(node) -> list[dict]:
 def _http_probes() -> list[tuple[str, str, str, dict]]:
     """(manifest, container, probe name, httpGet block) for every HTTP probe.
 
-    ``tcpSocket`` probes are deliberately not collected. The shard worker's
-    startupProbe dials rpc-server's :50052, which speaks a bespoke binary
-    protocol and no HTTP at all — a scheme there would be meaningless, and
-    :50052 is the one port that stays plaintext.
+    Only ``httpGet`` probes are collected. The shard worker's startupProbe (an
+    ``exec`` of ``client.rpc_probe``) connects to rpc-server's :50052, which
+    speaks a bespoke binary protocol and no HTTP at all — a scheme there would
+    be meaningless, and :50052 is the one port that stays plaintext.
     """
     probes: list[tuple[str, str, str, dict]] = []
     for manifest in sorted(K8S_DIR.glob("*.yaml")):
@@ -114,13 +114,18 @@ def test_the_scheme_check_has_something_to_check() -> None:
     )
 
 
-def test_the_shard_workers_keep_a_tcpsocket_probe_and_no_scheme() -> None:
+def test_the_shard_workers_probe_is_a_plain_connect_to_the_bound_address() -> None:
     """The exclusion above is scope, not an oversight.
 
-    rpc-server on :50052 serves no HTTP, has no TLS at any layer, and is the
-    only plaintext port left on a node. Its probe must stay ``tcpSocket``: an
-    httpGet there would fail forever, and ``scheme`` is not a field a tcpSocket
-    probe accepts.
+    rpc-server on :50052 serves no HTTP and has no TLS at any layer, so its
+    probe must never be an ``httpGet`` (it would fail forever). It is an
+    ``exec`` of ``client.rpc_probe`` rather than a ``tcpSocket``: a tcpSocket
+    probe can only dial the pod IP — the node's LAN address — while a worker
+    whose group has ``wireguard.enabled`` binds its tunnel address, so the
+    kubelet's dial would be refused until the budget expired. The module dials
+    what ``resolve_rpc_host`` says rpc-server binds, which on a LAN-bound
+    worker is the very address the tcpSocket probe used to dial
+    (tests/test_rpc_probe.py).
     """
     manifest = YAML().load((K8S_DIR / "daemonset-shard.yaml").read_text())
     containers = _containers(manifest)
@@ -130,11 +135,11 @@ def test_the_shard_workers_keep_a_tcpsocket_probe_and_no_scheme() -> None:
             continue  # Init containers complete before probes are meaningful.
         probe = container.get("startupProbe")
         assert probe is not None, f"{container.get('name')!r} has no startupProbe"
-        assert "tcpSocket" in probe, (
-            "the shard worker's startupProbe is no longer tcpSocket — rpc-server "
-            "speaks no HTTP, so an httpGet probe there never succeeds"
+        assert "httpGet" not in probe, "rpc-server speaks no HTTP; an httpGet probe never succeeds"
+        assert list(probe["exec"]["command"]) == ["/usr/local/bin/python", "-m", "client.rpc_probe"], (
+            "the shard worker's startupProbe must dial the address rpc-server binds "
+            "(client.rpc_probe), not the pod IP"
         )
-        assert "scheme" not in probe["tcpSocket"]
 
 
 # --- Dockerfiles: the OpenSSL build, asserted on the artefact -----------------
@@ -190,7 +195,7 @@ def test_the_cmake_invocation_asks_for_openssl_by_its_real_name(dockerfile) -> N
 
 @pytest.mark.parametrize("dockerfile", DOCKERFILES, ids=lambda p: p.name)
 def test_no_dockerfile_uses_the_option_name_that_does_not_exist(dockerfile) -> None:
-    """``LLAMA_SERVER_SSL`` is not a thing at b10375.
+    """``LLAMA_SERVER_SSL`` is not a thing at b11429.
 
     CMake treats an unknown ``-D`` as an unused cache variable and succeeds, so
     this typo produces a green build and a plaintext image — the exact failure
@@ -199,7 +204,7 @@ def test_no_dockerfile_uses_the_option_name_that_does_not_exist(dockerfile) -> N
     text = dockerfile.read_text()
     message = (
         f"{dockerfile.name} passes LLAMA_SERVER_SSL; the option is LLAMA_OPENSSL "
-        "(llama.cpp top-level CMakeLists.txt at b10375) and a misspelt -D is silently "
+        "(llama.cpp top-level CMakeLists.txt at b11429) and a misspelt -D is silently "
         "ignored"
     )
     # The flag form, not the bare name: the comment above the cmake invocation
@@ -323,3 +328,26 @@ def test_both_dockerfiles_pin_the_same_llama_cpp_commit() -> None:
         f"{client!r} is not a full 40-character commit sha; an abbreviated or empty pin "
         "never equals `git rev-parse HEAD` and fails every build"
     )
+
+
+def test_the_pinned_build_clears_the_security_floor() -> None:
+    """The pin must be a ``bNNNN`` tag at or above MIN_LLAMA_BUILD.
+
+    ``group doctor`` reads each member's build number with parse_llama_build,
+    which understands only the ``bNNNN`` form — a pin spelt any other way (a
+    release name, a bare sha) reads as "unknown" on every node. And a floor
+    raised without moving the pin would make every correctly built node warn.
+    """
+    from orchestrator.config.schema import MIN_LLAMA_BUILD, parse_llama_build
+
+    for path in DOCKERFILES:
+        for pin in _llama_pins(path):
+            build = parse_llama_build(pin)
+            assert build is not None, (
+                f"{path.name}: LLAMA_CPP_VERSION={pin} is not a bNNNN tag, so group "
+                "doctor cannot read the build number back off a node"
+            )
+            assert build >= MIN_LLAMA_BUILD, (
+                f"{path.name} pins b{build}, below the security floor b{MIN_LLAMA_BUILD} "
+                "(orchestrator/config/schema.py)"
+            )

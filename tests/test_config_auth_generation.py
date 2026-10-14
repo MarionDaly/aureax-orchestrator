@@ -353,8 +353,9 @@ def test_keys_llama_cpp_would_mangle_are_rejected(bad, why) -> None:
 
 
 def test_alias_with_a_comma_is_rejected() -> None:
-    """b10375 parses --alias as a comma-separated LIST, so "a,b" registers two
-    model ids and /v1/models reports something nobody configured."""
+    """The pinned build (b11429, like b10375) parses --alias as a
+    comma-separated LIST, so "a,b" registers two model ids and /v1/models
+    reports something nobody configured."""
     with pytest.raises(ValidationError, match="alias"):
         LlamaServerConfig(alias="a,b")
     assert LlamaServerConfig(alias="qwen3.5-35b").alias == "qwen3.5-35b"
@@ -452,8 +453,11 @@ def test_parse_llama_build_extracts_the_build_number(text, expected) -> None:
 
 def test_the_build_floor_is_above_the_rpc_rce_fix() -> None:
     """CVE-2026-34159 was an unauthenticated RCE in rpc-server's tensor-graph
-    deserialization; the pinned build must stay at or above the fixed build."""
-    assert MIN_LLAMA_BUILD >= 10375
+    deserialization; the pinned build must stay at or above the fixed build.
+    The floor itself sits at 11000 for the upstream #24292 RCE fix, so the old
+    b10375 pin reads as below it."""
+    assert MIN_LLAMA_BUILD >= 11000
+    assert parse_llama_build("b10375") < MIN_LLAMA_BUILD
     assert parse_llama_build("b9058") < MIN_LLAMA_BUILD
 
 

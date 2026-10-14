@@ -142,10 +142,19 @@ def get_llama_server_args(config: dict) -> list[str]:
     if threads_batch > 0:
         args += ["--threads-batch", str(threads_batch)]
 
-    if server_cfg.get("use_mlock"):
-        args.append("--mlock")
-    if not server_cfg.get("use_mmap", True):
-        args.append("--no-mmap")
+    # Weight load mode. --mlock, --mmap and --no-mmap were REMOVED upstream in
+    # b10875 (#28334), and llama-server exits 1 on an unknown argument, so the
+    # two booleans map onto -lm/--load-mode instead — which already exists,
+    # with the same values, at b10375, so this argv is valid on both sides of
+    # the pin move. Old meaning kept: --mlock was load mode mlock, --no-mmap
+    # was none. mmap on + mlock off is llama.cpp's own default and emits
+    # nothing. Defaults re-declared from LlamaServerConfig (raw dict here).
+    use_mmap = bool(server_cfg.get("use_mmap", True))
+    use_mlock = bool(server_cfg.get("use_mlock", False))
+    if use_mlock:
+        args += ["--load-mode", "mmap+mlock" if use_mmap else "mlock"]
+    elif not use_mmap:
+        args += ["--load-mode", "none"]
     # Unconditional: see resolve_flash_attn. Omitting the flag hands the
     # decision to llama.cpp's AUTO probe, which over RPC always says yes.
     args += ["--flash-attn", resolve_flash_attn(server_cfg.get("flash_attention"))]
@@ -159,6 +168,30 @@ def get_llama_server_args(config: dict) -> list[str]:
         args.append("--metrics")
     if server_cfg.get("backend_sampling"):
         args.append("--backend-sampling")
+
+    # Sampler chain, ';'-joined as llama-server expects. Omitted when unset or
+    # empty so an omitting config keeps llama.cpp's default chain. What makes
+    # this worth a flag is backend_sampling above: with the DEFAULT chain the
+    # backend prefix stops at `penalties` and the full 993,280 B logits row
+    # still comes back every token; a chain of backend-capable samplers is
+    # what actually removes it (LlamaServerConfig.samplers has the list).
+    samplers = server_cfg.get("samplers") or []
+    if samplers:
+        args += ["--samplers", ";".join(str(s) for s in samplers)]
+
+    # Prompt cache for displaced slots, in MiB. Emitted only when set, so an
+    # omitting config runs llama.cpp's default. A sharded head sets 0: at b10375
+    # the save path aborted llama-server over RPC (upstream issue #26529, since
+    # closed not-planned; whether b11429 still aborts is unconfirmed), and the
+    # cache was never in the head's memory budget anyway.
+    cache_ram = server_cfg.get("cache_ram_mib")
+    if cache_ram is not None:
+        args += ["--cache-ram", str(cache_ram)]
+
+    # Per-slot context checkpoints. Emitted only when set, for the same reason.
+    checkpoints = server_cfg.get("ctx_checkpoints")
+    if checkpoints is not None:
+        args += ["--ctx-checkpoints", str(checkpoints)]
 
     # Omitted means the FLAG is omitted, which lands on llama.cpp's own f16 —
     # the same value LlamaServerConfig now defaults to, so the two agree. Do
@@ -181,8 +214,9 @@ def get_llama_server_args(config: dict) -> list[str]:
     if not server_cfg.get("slots", False):
         args.append("--no-slots")
 
-    # --no-webui, not --no-ui: both exist on the pinned build (b10375) but the
-    # older spelling is the safer one across versions. The web UI's static
+    # --no-webui, not --no-ui: both existed at b10375 and --no-webui is
+    # unchanged at the pinned build (b11429); the older spelling is the safer
+    # one across versions. The web UI's static
     # assets are EXEMPT from --api-key auth, so on an API-only node this flag
     # is what actually removes the surface.
     if not server_cfg.get("webui", True):
@@ -198,27 +232,44 @@ def get_llama_server_args(config: dict) -> list[str]:
     if alias:
         args += ["--alias", str(alias)]
 
-    # --- Speculative decoding (draft model) ---------------------------------
-    # Flag spellings verified against `llama-server --help` on the pinned build
-    # (b10375), which uses the --spec-draft-* family; -md/--draft-p-min etc. are
-    # aliases. Getting one wrong makes llama-server exit at startup, so the
-    # canonical long forms are used here.
+    # --- Speculative decoding --------------------------------------------------
+    # Flag spellings verified against common/arg.cpp at the pinned build
+    # (b11429, unchanged since b10375): the --spec-draft-* family, plus
+    # --spec-type and --spec-draft-device. Getting one wrong makes llama-server
+    # exit at startup, so the canonical long forms are used here.
     #
-    # Emitted only when explicitly enabled AND a filename is set: a draft model
-    # whose vocabulary does not match the target is a hard load failure, so this
-    # never turns itself on by inference.
+    # --spec-type is NOT optional. On the pinned build the default type list is {none}
+    # and a speculator is created only for a listed type, so the --spec-draft-*
+    # flags on their own make llama-server load the draft model and then
+    # discard it — which is what this builder did until the `type` field
+    # existed, and why the fleet's earlier "speculation changed nothing"
+    # measurement measured a loaded, unused draft.
+    #
+    # Emitted only when explicitly enabled — and, for draft-simple, only with a
+    # filename: a draft model whose vocabulary does not match the target is a
+    # hard load failure, so this never turns itself on by inference. draft-mtp
+    # uses the target's own MTP head and takes no draft file.
     draft_cfg = model_cfg.get("draft") or {}
-    if draft_cfg.get("enabled") and draft_cfg.get("filename"):
-        draft_file = model_path / draft_cfg["filename"]
+    draft_type = str(draft_cfg.get("type") or "draft-simple")
+    if draft_cfg.get("enabled") and (draft_type == "draft-mtp" or draft_cfg.get("filename")):
         args += [
-            "--spec-draft-model", str(draft_file),
+            "--spec-type", draft_type,
             "--spec-draft-n-max", str(draft_cfg.get("n_max", 4)),
             "--spec-draft-n-min", str(draft_cfg.get("n_min", 1)),
             "--spec-draft-p-min", str(draft_cfg.get("p_min", 0.6)),
+        ]
+    if draft_cfg.get("enabled") and draft_type == "draft-simple" and draft_cfg.get("filename"):
+        draft_file = model_path / draft_cfg["filename"]
+        draft_devices = draft_cfg.get("devices") or []
+        args += [
+            "--spec-draft-model", str(draft_file),
             # Explicit, not defaulted: if the draft followed the target's
             # --n-gpu-layers onto the RPC devices, its weights would be shipped
             # over the LAN and every draft token would cost network hops.
             "--spec-draft-ngl", str(draft_cfg.get("gpu_layers", 0)),
+            # `none` keeps the draft off every accelerator, RPC devices included;
+            # llama.cpp otherwise offers it the target's device list.
+            "--spec-draft-device", ",".join(str(d) for d in draft_devices) if draft_devices else "none",
         ]
         # Falls back to DraftModelConfig's own default of 4, not to "omit the
         # flag": schema defaults are never serialised into a deployed config, so
@@ -254,13 +305,30 @@ def get_llama_server_args(config: dict) -> list[str]:
 def resolve_rpc_host(config: dict) -> str:
     """The address rpc-server will actually bind.
 
-    Shared with the supervisor's readiness check: because "auto" binds one
-    specific interface rather than 0.0.0.0, probing loopback would never see
-    the listener even though it is up and serving.
+    Shared with the supervisor's readiness check and the shard pod's startup
+    probe (client/rpc_probe.py): because "auto" binds one specific interface
+    rather than 0.0.0.0, probing loopback would never see the listener even
+    though it is up and serving.
+
+    "auto" means, in order:
+
+    * the node's WireGuard tunnel address, when the orchestrator stamped a
+      ``node.wireguard`` block (only members of a group with
+      ``wireguard.enabled`` carry one). The prefix length is dropped — the
+      block holds wg-quick's ``Address=`` value, rpc-server's ``-H`` takes a
+      bare address. Binding the tunnel address alone is what keeps the port
+      off the LAN entirely; see ARCHITECTURE.md, "WireGuard transport for
+      rpc-server".
+    * otherwise the node's LAN address from the AUREAX_HOST_IP downward-API
+      env var, and 0.0.0.0 only if that is missing.
     """
-    rpc_cfg = (config.get("model") or {}).get("rpc_server", {})
+    rpc_cfg = (config.get("model") or {}).get("rpc_server") or {}
     host = rpc_cfg.get("host", "auto")
     if host == "auto":
+        wireguard = (config.get("node") or {}).get("wireguard") or {}
+        address = wireguard.get("address") if isinstance(wireguard, dict) else None
+        if address:
+            return str(address).split("/", 1)[0]
         # Bind the node's own LAN address rather than 0.0.0.0 — this port has
         # no authentication, so it should not be offered on every interface
         # the node happens to have. Falls back to all-interfaces only if the
@@ -302,8 +370,20 @@ def get_rpc_server_args(config: dict) -> list[str]:
         # pod restart re-pulls this node's multi-GiB share over the network.
         args.append("-c")
 
+    # Which ggml devices to expose, comma-joined. Omitted = rpc-server's own
+    # default (every non-CPU device, else the CPU). Each exposed device is one
+    # RPC device on the head, so a multi-GPU worker names exactly the one it
+    # means to lend, or it silently takes two slots in the head's split.
+    devices = rpc_cfg.get("devices") or []
+    if devices:
+        args += ["-d", ",".join(str(d) for d in devices)]
+
     # NOTE: no memory-advertisement flag. rpc-server in the pinned build
-    # (b10375) accepts only -h/-t/-d/-H/-p/-c — verified against --help — and
-    # passing an unknown option makes it exit immediately. It reports actual
-    # free memory to the head on its own, which is what the default split uses.
+    # (b11429, as at b10375) accepts only -h/-t/-d/-H/-p/-c — verified against
+    # its source — and passing an unknown option makes it exit immediately,
+    # with status 0. What it reports to the head for a CPU device is total
+    # physical RAM as both total AND free (ggml-cpu dev_memory on the pinned
+    # build): not the cgroup limit, not actual usage.
+    # That figure is what an EMPTY tensor_split would split by, which is one
+    # reason the head templates always carry an explicit split.
     return args

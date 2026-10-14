@@ -294,6 +294,98 @@ def test_validate_groups_rejects_mismatched_tensor_split(tmp_path) -> None:
     assert any("tensor_split has 3 entries but 2 device(s)" in p for p in problems)
 
 
+HEAD_YAML_PLACED = HEAD_YAML.replace(
+    'server: {gpu_layers: 99, rpc_servers: "${rpc_servers}", tensor_split: []}',
+    'server: {gpu_layers: "${gpu_layers}", rpc_servers: "${rpc_servers}", tensor_split: "${tensor_split}"}',
+)
+
+
+def test_validate_groups_accepts_the_placement_placeholders(tmp_path) -> None:
+    """A head may hand placement to the group: `${tensor_split}` and
+    `${gpu_layers}` are resolved per group from node_groups.head_layers."""
+    assert HEAD_YAML_PLACED != HEAD_YAML
+    _write_group_configs(tmp_path, head=HEAD_YAML_PLACED)
+    cfg = _net(make_targets("h", "w1", "w2"), [GROUP])
+    assert validate_groups(cfg, tmp_path) == []
+
+
+def test_tensor_split_is_checked_against_devices_not_workers(tmp_path) -> None:
+    """A worker that lends two GPUs is two RPC devices behind one address, so
+    a two-worker group with such a worker takes a three-entry split."""
+    two_gpu = WORKER_YAML.replace("rpc_server: {port: 50052}", "rpc_server: {port: 50052, devices: [CUDA0, CUDA1]}")
+    (tmp_path / "h.yaml").write_text(HEAD_YAML.replace("tensor_split: []", "tensor_split: [1, 1, 1]"))
+    (tmp_path / "w1.yaml").write_text(two_gpu)
+    (tmp_path / "w2.yaml").write_text(WORKER_YAML)
+    cfg = _net(make_targets("h", "w1", "w2"), [GROUP])
+    assert validate_groups(cfg, tmp_path) == []
+
+    (tmp_path / "h.yaml").write_text(HEAD_YAML.replace("tensor_split: []", "tensor_split: [1, 1]"))
+    _bump_mtime(tmp_path / "h.yaml")
+    problems = validate_groups(cfg, tmp_path)
+    assert any("tensor_split has 2 entries but 3 device(s)" in p for p in problems)
+
+
+def test_head_resident_layers_require_the_placement_placeholders(tmp_path) -> None:
+    """A literal split cannot follow a changed layer range, so head_layers > 0
+    with a literal template is refused by name."""
+    _write_group_configs(tmp_path)
+    cfg = _net(make_targets("h", "w1", "w2"), [{**GROUP, "head_layers": 4}])
+    problems = validate_groups(cfg, tmp_path)
+    assert any("head_layers 4" in p and "${tensor_split}" in p for p in problems)
+
+    _write_group_configs(tmp_path, head=HEAD_YAML_PLACED)
+    _bump_mtime(tmp_path / "h.yaml")
+    assert validate_groups(cfg, tmp_path) == []
+
+
+def test_build_variables_place_the_head_from_the_group(tmp_path) -> None:
+    """head_layers 0 keeps today's [1, 1] / 99; head-resident layers resolve to
+    integer slot counts whose sum is the offloaded slot count, using the
+    registry's layer hint when the GGUF is not on this machine."""
+    _write_group_configs(tmp_path, head=HEAD_YAML_PLACED)
+    cfg = _net(make_targets("h", "w1", "w2"), [GROUP])
+    head = next(t for t in cfg.ssh.targets if t.node_id == "h")
+    vars_default = build_variables(head, cfg, "10.77.0.99", configs_dir=tmp_path)
+    assert (vars_default["tensor_split"], vars_default["gpu_layers"]) == ([1, 1], 99)
+
+    models = [{**MODELS[0], "layers": 12}]
+    cfg = make_network_config(make_targets("h", "w1", "w2"), [{**GROUP, "head_layers": 4}], models=models)
+    head = next(t for t in cfg.ssh.targets if t.node_id == "h")
+    vars_placed = build_variables(head, cfg, "10.77.0.99", configs_dir=tmp_path)
+    # 12 layers + output = 13 slots, 4 on the head, 9 over 2 devices: ngl 9, [5, 4]
+    assert vars_placed["gpu_layers"] == 9
+    assert vars_placed["tensor_split"] == [5, 4]
+
+    # A worker never carries placement values that do anything.
+    worker = next(t for t in cfg.ssh.targets if t.node_id == "w1")
+    assert build_variables(worker, cfg, "10.77.0.99", configs_dir=tmp_path)["tensor_split"] == []
+
+
+def test_head_layers_without_a_layer_count_fail_generation_by_name(tmp_path) -> None:
+    _write_group_configs(tmp_path, head=HEAD_YAML_PLACED)
+    cfg = _net(make_targets("h", "w1", "w2"), [{**GROUP, "head_layers": 4}])
+    head = next(t for t in cfg.ssh.targets if t.node_id == "h")
+    with pytest.raises(ValueError, match="layers:"):
+        build_variables(head, cfg, "10.77.0.99", configs_dir=tmp_path)
+
+
+def test_generated_head_is_stamped_with_the_device_count(tmp_aureax_home, tmp_path) -> None:
+    """The head's own topology check compares its split against this stamp."""
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "h.yaml").write_text(HEAD_YAML_PLACED)
+    (configs / "w1.yaml").write_text(WORKER_YAML.replace("rpc_server: {port: 50052}", "rpc_server: {port: 50052, devices: [CUDA0, CUDA1]}"))
+    (configs / "w2.yaml").write_text(WORKER_YAML)
+    net = _write_network(configs)
+    out = tmp_path / "out"
+    paths = {p.stem: p for p in generate_all_edge_configs(net, out, "10.77.0.99")}
+    head = load_edge_config_cached(paths["aureax-edge-h"])
+    assert head["model"]["server"]["rpc_device_count"] == 3
+    assert head["model"]["server"]["tensor_split"] == [1, 1, 1]
+    assert head["model"]["server"]["gpu_layers"] == 99
+    assert "rpc_device_count" not in (load_edge_config_cached(paths["aureax-edge-w1"])["model"].get("server") or {})
+
+
 def test_validate_groups_rejects_head_without_gpu_layers(tmp_path) -> None:
     """-ngl 0 keeps every layer on the head's CPU while the workers idle.
 
@@ -1109,8 +1201,9 @@ def test_a_reordered_workers_list_is_accepted_with_the_flag_and_rebaselined(
 def test_changing_the_worker_SET_is_a_warning_not_an_error(
     group_fleet, caplog, workers, why
 ) -> None:
-    """Resizing a group costs a cold load — the head re-streams every tensor —
-    but it is the documented way to resize, so it must not refuse."""
+    """Resizing a group costs a partial cold load — the head re-streams every
+    tensor that lands on a worker that never held it — but it is the
+    documented way to resize, so it must not refuse."""
     configs, out = group_fleet
 
     with caplog.at_level(logging.WARNING, logger="aureax.config.templating"):
@@ -1208,3 +1301,349 @@ def test_a_head_with_only_link_local_answers_fails_generation(monkeypatch) -> No
     monkeypatch.setattr(templating_mod.socket, "getaddrinfo", fake_getaddrinfo)
     with pytest.raises(ValueError, match="resolves to no address"):
         templating_mod.resolve_host_literals("head.local", "w1")
+
+
+# --- WireGuard transport (opt-in per group) -----------------------------------
+# rpc-server is plaintext and unauthenticated by construction. With a group's
+# `wireguard.enabled`, the head dials each worker's TUNNEL address, the worker
+# binds only that address and allowlists only the head's tunnel address, and
+# every member carries a stamped node.wireguard block. Without it, nothing in a
+# generated config may change — the opt-in has to be provably inert.
+
+WG_FLEET_TARGETS = (
+    "    - {node_id: h, host: 10.77.0.1, config_file: h.yaml}\n"
+    "    - {node_id: w1, host: 10.77.0.11, config_file: w1.yaml}\n"
+    "    - {node_id: w2, host: 10.77.0.12, config_file: w2.yaml}\n"
+    "    - {node_id: h2, host: 10.77.0.2, config_file: h.yaml}\n"
+    "    - {node_id: w3, host: 10.77.0.13, config_file: w3.yaml}\n"
+    "    - {node_id: solo, host: 10.77.0.50, config_file: solo.yaml}\n"
+)
+
+SOLO_YAML = """
+node: {id: "${node_id}", role: "edge_executor", control_plane: {endpoint: "x"}}
+model: {name: M, filename: m.gguf}
+mcp: {server: {enabled: true}}
+"""
+
+
+def _write_wg_fleet(configs: Path, g_wireguard: str = "", g2_wireguard: str = "") -> Path:
+    """Two groups (h + w1, w2 and h2 + w3) and a standalone node.
+
+    ``g_wireguard`` / ``g2_wireguard`` are inline YAML for each group's
+    ``wireguard:`` key, or "" to leave the key out entirely.
+    """
+    configs.mkdir(parents=True, exist_ok=True)
+    _write_group_configs(configs, workers=("w1", "w2", "w3"))
+    (configs / "solo.yaml").write_text(SOLO_YAML)
+    g = f", wireguard: {g_wireguard}" if g_wireguard else ""
+    g2 = f", wireguard: {g2_wireguard}" if g2_wireguard else ""
+    net = configs / "aureax-network.yaml"
+    net.write_text(
+        "network: {name: t, version: '0.1.0'}\n"
+        "model_registry: {models: []}\n"
+        "ssh:\n  targets:\n" + WG_FLEET_TARGETS
+        + "node_groups:\n"
+        f"  - {{name: g, head: h, workers: [w1, w2]{g}}}\n"
+        f"  - {{name: g2, head: h2, workers: [w3]{g2}}}\n"
+    )
+    return net
+
+
+def _load_generated(out: Path) -> dict[str, dict]:
+    """Every generated config by node id, minus the one field that is a clock."""
+    from ruamel.yaml import YAML
+
+    docs = {}
+    for path in sorted(out.glob("aureax-edge-*.yaml")):
+        doc = YAML(typ="safe").load(path.read_text())
+        doc["deployment"].pop("deployed_at", None)
+        docs[path.stem.removeprefix("aureax-edge-")] = doc
+    return docs
+
+
+def _wg_cfg(**wireguard) -> NetworkConfig:
+    targets = make_targets("h", "w1", "w2")
+    return _net(targets, [{**GROUP, "wireguard": {"enabled": True, **wireguard}}])
+
+
+def test_wireguard_addresses_number_the_head_first_then_workers_in_rpc_order() -> None:
+    cfg = _wg_cfg()
+    group = cfg.node_groups[0]
+    assert cfg.wireguard_addresses(group) == {"h": "10.254.0.1", "w1": "10.254.0.2", "w2": "10.254.0.3"}
+    assert str(cfg.wireguard_network(group)) == "10.254.0.0/24"
+
+    pinned = _wg_cfg(subnet="172.31.7.0/24")
+    assert pinned.wireguard_addresses(pinned.node_groups[0])["w2"] == "172.31.7.3"
+
+
+def test_the_default_subnet_follows_the_group_index() -> None:
+    cfg = _net(
+        make_targets("h", "w1", "h2", "w2"),
+        [{"name": "a", "head": "h", "workers": ["w1"], "wireguard": {"enabled": True}},
+         {"name": "b", "head": "h2", "workers": ["w2"], "wireguard": {"enabled": True}}],
+    )
+    assert [str(cfg.wireguard_network(g)) for g in cfg.node_groups] == ["10.254.0.0/24", "10.254.1.0/24"]
+
+
+def test_a_disabled_group_has_no_tunnel_addresses() -> None:
+    cfg = _net(make_targets("h", "w1", "w2"), [GROUP])
+    assert cfg.node_groups[0].wireguard.enabled is False
+    assert cfg.wireguard_addresses(cfg.node_groups[0]) is None
+    assert cfg.wireguard_network(cfg.node_groups[0]) is None
+
+
+def test_rpc_servers_dial_tunnel_addresses_only_when_the_group_enables_it() -> None:
+    plain = _net(make_targets("h", "w1", "w2"), [GROUP])
+    assert build_variables(plain.ssh.targets[0], plain, "127.0.0.1")["rpc_servers"] == [
+        "10.77.0.2:50052", "10.77.0.3:50052",
+    ]
+    tunnel = _wg_cfg()
+    assert build_variables(tunnel.ssh.targets[0], tunnel, "127.0.0.1")["rpc_servers"] == [
+        "10.254.0.2:50052", "10.254.0.3:50052",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("groups", "message"),
+    [
+        ([{"name": "a", "head": "h", "workers": ["w1"], "wireguard": {"enabled": True, "subnet": "10.9.0.0/24"}},
+          {"name": "b", "head": "h2", "workers": ["w2"], "wireguard": {"enabled": True, "subnet": "10.9.0.0/16"}}],
+         "overlap"),
+        ([{"name": "a", "head": "h", "workers": ["w1"], "wireguard": {"enabled": True, "subnet": "10.254.1.0/24"}},
+          {"name": "b", "head": "h2", "workers": ["w2"], "wireguard": {"enabled": True}}],
+         "overlap"),
+        ([{"name": "a", "head": "h", "workers": ["w1"], "wireguard": {"enabled": True, "subnet": "10.77.0.0/24"}}],
+         "contains h's own address"),
+        ([{"name": "a", "head": "h", "workers": ["w1"], "wireguard": {"enabled": True, "subnet": "10.9.0.0/25"}}],
+         r"/24 or larger"),
+        ([{"name": "a", "head": "h", "workers": ["w1"], "wireguard": {"enabled": True, "subnet": "10.9.0.1/24"}}],
+         "network address"),
+        ([{"name": "a", "head": "h", "workers": ["w1"], "wireguard": {"enabled": True, "subnet": "fd00::/64"}}],
+         "IPv4"),
+        ([{"name": "a", "head": "h", "workers": ["w1"], "wireguard": {"enabled": True, "persistent_keepalive": 0}}],
+         "keepalive"),
+        ([{"name": "a", "head": "h", "workers": ["w1"], "wireguard": {"enabled": True, "listen_port": 0}}],
+         "UDP port"),
+    ],
+)
+def test_unusable_wireguard_settings_are_refused(groups, message) -> None:
+    with pytest.raises(ValidationError, match=message):
+        _net(make_targets("h", "w1", "h2", "w2"), groups)
+
+
+def test_disabled_groups_may_share_a_subnet() -> None:
+    """Only enabled groups configure an interface, so only they can collide."""
+    cfg = _net(
+        make_targets("h", "w1", "h2", "w2"),
+        [{"name": "a", "head": "h", "workers": ["w1"], "wireguard": {"subnet": "10.9.0.0/24"}},
+         {"name": "b", "head": "h2", "workers": ["w2"], "wireguard": {"enabled": True, "subnet": "10.9.0.0/24"}}],
+    )
+    assert str(cfg.wireguard_network(cfg.node_groups[1])) == "10.9.0.0/24"
+
+
+def test_a_fleet_without_wireguard_generates_exactly_what_it_did_before(
+    tmp_aureax_home, tmp_path
+) -> None:
+    """The opt-in must be inert: `wireguard: {enabled: false}` and no key at all
+    generate the same configs, nobody carries node.wireguard, every worker still
+    allowlists its head's LAN address and every head still dials LAN addresses,
+    and no WireGuard key is minted."""
+    absent = _write_wg_fleet(tmp_path / "absent")
+    _generate(absent, tmp_path / "out-absent")
+    disabled = _write_wg_fleet(
+        tmp_path / "disabled", g_wireguard="{enabled: false, subnet: 10.9.0.0/24}",
+        g2_wireguard="{enabled: false}",
+    )
+    _generate(disabled, tmp_path / "out-disabled")
+
+    without = _load_generated(tmp_path / "out-absent")
+    with_off = _load_generated(tmp_path / "out-disabled")
+    assert without == with_off
+    for node_id, doc in without.items():
+        assert "wireguard" not in doc["node"], node_id
+    assert without["h"]["model"]["server"]["rpc_servers"] == ["10.77.0.11:50052", "10.77.0.12:50052"]
+    assert without["w1"]["model"]["rpc_server"]["allowed_clients"] == ["10.77.0.1"]
+    assert not (tmp_aureax_home / ".aureax" / "wireguard").exists()
+
+
+def test_enabling_one_group_changes_only_that_groups_configs(tmp_aureax_home, tmp_path) -> None:
+    off = _write_wg_fleet(tmp_path / "off")
+    _generate(off, tmp_path / "out-off")
+    on = _write_wg_fleet(tmp_path / "on", g_wireguard="{enabled: true}")
+    _generate(on, tmp_path / "out-on")
+
+    before = _load_generated(tmp_path / "out-off")
+    after = _load_generated(tmp_path / "out-on")
+    for node_id in ("h2", "w3", "solo"):
+        assert after[node_id] == before[node_id], f"{node_id} is outside the tunnel and changed"
+
+    assert after["h"]["model"]["server"]["rpc_servers"] == ["10.254.0.2:50052", "10.254.0.3:50052"]
+    assert after["h"]["node"]["wireguard"] == {"interface": "wg0", "address": "10.254.0.1/24"}
+    assert after["w1"]["node"]["wireguard"] == {"interface": "wg0", "address": "10.254.0.2/24"}
+    assert after["w2"]["node"]["wireguard"] == {"interface": "wg0", "address": "10.254.0.3/24"}
+    # The head's TUNNEL address and only that: an allowlisted LAN address would
+    # be a second way to rpc-server that WireGuard never authenticated.
+    for worker in ("w1", "w2"):
+        assert after[worker]["model"]["rpc_server"]["allowed_clients"] == ["10.254.0.1"]
+    # A changed allowlist or peer list must restage the node.
+    assert after["w1"]["deployment"]["config_hash"] != before["w1"]["deployment"]["config_hash"]
+
+
+def test_generate_mints_a_pair_for_every_member_of_an_enabled_group_only(
+    tmp_aureax_home, tmp_path
+) -> None:
+    from orchestrator.config import wgstore
+
+    _generate(_write_wg_fleet(tmp_path / "c", g_wireguard="{enabled: true}"), tmp_path / "out")
+
+    for node_id in ("h", "w1", "w2"):
+        assert wgstore.public_key(node_id), node_id
+    for node_id in ("h2", "w3", "solo"):
+        assert wgstore.private_key(node_id) is None, f"{node_id} is not in a tunnel but got a key"
+
+
+def test_a_hand_written_wireguard_block_is_replaced_or_removed(tmp_aureax_home, tmp_path, caplog) -> None:
+    """The block is generator output; a template that carries one is lying."""
+    configs = tmp_path / "c"
+    net = _write_wg_fleet(configs, g_wireguard="{enabled: true}")
+    (configs / "solo.yaml").write_text(
+        SOLO_YAML.replace('control_plane: {endpoint: "x"}',
+                          'control_plane: {endpoint: "x"}, wireguard: {interface: wg0, address: 10.9.9.9/24}')
+    )
+    caplog.set_level(logging.WARNING, logger="aureax.config.templating")
+
+    _generate(net, tmp_path / "out")
+
+    docs = _load_generated(tmp_path / "out")
+    assert "wireguard" not in docs["solo"]["node"]
+    assert any("not in a group with wireguard.enabled" in r.getMessage() for r in caplog.records)
+
+
+def test_a_worker_with_a_literal_rpc_host_is_refused_under_wireguard(tmp_path) -> None:
+    """Only `host: auto` resolves to the tunnel address on the node."""
+    _write_group_configs(tmp_path, worker=WORKER_YAML.replace("{port: 50052}", "{port: 50052, host: 10.77.0.2}"))
+    tunnel = _wg_cfg()
+    problems = validate_groups(tunnel, tmp_path)
+    assert any("wireguard.enabled" in p and "host: auto" in p for p in problems), problems
+
+    plain = _net(make_targets("h", "w1", "w2"), [GROUP])
+    assert not any("wireguard" in p for p in validate_groups(plain, tmp_path))
+
+
+# --- render_wg_config: the node's wg0.conf --------------------------------------
+
+# Fixed keys so the whole file can be compared as text. The public halves were
+# derived once with cryptography's X25519 and are spelled out, so the golden is
+# not computed by the code under test.
+_FIXED_KEYS = {
+    "h": ("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", "pOCSkrZRwni5dyxWn1+puxPZBrRqtoyd+dwrRAn4ogk="),
+    "w1": ("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=", "zo060cy2M+x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk="),
+    "w2": ("AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=", "Xf7dO2vUf2+ijuFdlp1bsOpTd01Ii9r53xxuASSz7yI="),
+}
+
+GOLDEN_HEAD_CONF = """\
+# wg0.conf for h (head of group g).
+# Written by `aureax apply`; edits are overwritten. Carries rpc-server's traffic;
+# see ARCHITECTURE.md, "WireGuard transport for rpc-server".
+[Interface]
+PrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+Address = 10.254.0.1/24
+ListenPort = 51820
+MTU = 1420
+
+[Peer]
+# w1 (worker)
+PublicKey = zo060cy2M+x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk=
+AllowedIPs = 10.254.0.2/32
+
+[Peer]
+# w2 (worker)
+PublicKey = Xf7dO2vUf2+ijuFdlp1bsOpTd01Ii9r53xxuASSz7yI=
+AllowedIPs = 10.254.0.3/32
+"""
+
+GOLDEN_WORKER_CONF = """\
+# wg0.conf for w2 (worker of group g).
+# Written by `aureax apply`; edits are overwritten. Carries rpc-server's traffic;
+# see ARCHITECTURE.md, "WireGuard transport for rpc-server".
+[Interface]
+PrivateKey = AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=
+Address = 10.254.0.3/24
+ListenPort = 51820
+MTU = 1420
+
+[Peer]
+# h (head)
+PublicKey = pOCSkrZRwni5dyxWn1+puxPZBrRqtoyd+dwrRAn4ogk=
+AllowedIPs = 10.254.0.1/32
+Endpoint = 10.77.0.1:51820
+PersistentKeepalive = 25
+"""
+
+
+def _install_fixed_keys(node_ids=("h", "w1", "w2")) -> None:
+    from orchestrator.config import wgstore
+
+    for node_id in node_ids:
+        key_path, _ = wgstore.key_paths(node_id)
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        key_path.write_text(_FIXED_KEYS[node_id][0] + "\n")
+
+
+def test_render_wg_config_matches_the_golden_files(tmp_aureax_home) -> None:
+    from orchestrator.config import wgstore
+    from orchestrator.config.templating import render_wg_config
+
+    _install_fixed_keys()
+    for node_id, (_priv, pub) in _FIXED_KEYS.items():
+        assert wgstore.public_key(node_id) == pub, "the golden's public keys are wrong"
+
+    cfg = _wg_cfg()
+    assert render_wg_config("h", cfg) == GOLDEN_HEAD_CONF
+    assert render_wg_config("w2", cfg) == GOLDEN_WORKER_CONF
+    # Deterministic: the deployer restarts the tunnel only when this text changes.
+    assert render_wg_config("h", cfg) == render_wg_config("h", cfg)
+
+
+def test_render_wg_config_follows_the_groups_settings(tmp_aureax_home) -> None:
+    from orchestrator.config.templating import render_wg_config
+
+    _install_fixed_keys()
+    cfg = _wg_cfg(subnet="172.31.7.0/24", listen_port=51999, mtu=1380, persistent_keepalive=10)
+    worker = render_wg_config("w1", cfg)
+    assert "Address = 172.31.7.2/24" in worker
+    assert "ListenPort = 51999" in worker and "MTU = 1380" in worker
+    assert "Endpoint = 10.77.0.1:51999" in worker
+    assert "PersistentKeepalive = 10" in worker
+    assert "AllowedIPs = 172.31.7.1/32" in worker
+    # A worker peers with the head alone — workers never talk to each other.
+    assert worker.count("[Peer]") == 1
+
+
+def test_render_wg_config_brackets_an_ipv6_endpoint(tmp_aureax_home) -> None:
+    from orchestrator.config.templating import render_wg_config
+
+    _install_fixed_keys(("h", "w1"))
+    cfg = make_network_config(
+        [{"node_id": "h", "host": "fd00::1", "config_file": "h.yaml"},
+         {"node_id": "w1", "host": "fd00::2", "config_file": "w1.yaml"}],
+        [{"name": "g", "head": "h", "workers": ["w1"], "wireguard": {"enabled": True}}],
+        models=MODELS,
+    )
+    assert "Endpoint = [fd00::1]:51820" in render_wg_config("w1", cfg)
+
+
+def test_render_wg_config_refuses_a_missing_key_by_naming_generate(tmp_aureax_home) -> None:
+    from orchestrator.config.templating import render_wg_config
+
+    _install_fixed_keys(("h", "w1"))  # w2 never minted
+    with pytest.raises(ValueError, match=r"w2 has no WireGuard key.*aureax generate"):
+        render_wg_config("h", _wg_cfg())
+
+
+def test_render_wg_config_refuses_a_node_outside_an_enabled_group(tmp_aureax_home) -> None:
+    from orchestrator.config.templating import render_wg_config
+
+    plain = _net(make_targets("h", "w1", "w2"), [GROUP])
+    with pytest.raises(ValueError, match=r"wireguard\.enabled"):
+        render_wg_config("w1", plain)

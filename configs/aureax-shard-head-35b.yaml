@@ -45,15 +45,20 @@ node:
   display_name: "${display_name}"
   tags: ${tags}
 
-  # MEASURED OFF ON THE HEAD. Pinning to the A76 cluster (cpu4-7) was worth
-  # nothing for decode (1.607 vs 1.602 tok/s pinned vs unpinned) and cost
-  # prefill 7% (0.80 vs 0.861 tok/s), measured live by re-running taskset
-  # against the same process.
+  # Not pinned on the head. The only measurement is from the PREVIOUS model
+  # (the 122B on seven workers, configs/aureax-shard-head.yaml): pinning to
+  # the A76 cluster was worth nothing for decode and cost prefill 7%, measured
+  # live by re-running taskset against the same process. It has not been
+  # repeated on this model — no decode or prefill number for the 35B groups
+  # has been recorded yet; scripts/bench-decode.sh is the tool — so this is
+  # carried over as the safe default, not asserted as a fact about this file.
   #
   # The likely reason is specific to the head: it is not only computing, it is
-  # staging every hidden-state handoff between workers and moving ~100 MiB per
-  # prefill batch. Confining the RPC I/O threads to the same four cores as the
-  # compute threads makes them contend, and prefill is where that shows.
+  # staging every hidden-state handoff between workers and, at long context,
+  # streaming the attention mask to every worker on every prefill micro-batch
+  # (up to 128 MiB per worker per 512-token batch at 128k). Confining the RPC
+  # I/O threads to the same four cores as the compute threads makes them
+  # contend, and prefill is where that shows.
   #
   # The worker case is different — see aureax-shard-worker-35b.yaml, which keeps it.
   cpu_affinity: []
@@ -106,8 +111,10 @@ model:
     # where !hparams.has_kv(il) — so KV is
     #     10 layers x 2 KV heads x 256 head_dim x 2 (K+V) x 2 B = 20 KiB/token
     # => 2.50 GiB at 131072 ctx, for the WHOLE group. The 30 linear-attention
-    # layers instead hold a fixed ~126 MiB recurrent state that does not grow
-    # with context but is read AND written every step.
+    # layers instead hold a fixed recurrent state — 128 x 4096 f32 of SSM state
+    # plus a 3 x 8192 f32 conv window per layer, ~2.1 MiB each, ~63 MiB for the
+    # whole group per sequence — that does not grow with context but is read
+    # AND written every step. (The earlier "~126 MiB" figure double-counted.)
     #
     # KV allocates on the RPC device that holds the layer, not on the head, so
     # that 2.50 GiB spreads across the three workers. Corollary: never pass
@@ -138,8 +145,9 @@ model:
     threads_batch: 4
 
     use_mlock: false
-    # Keep true. --no-mmap would turn a reclaimable page cache into a hard
-    # resident allocation on a 16 GB node with no swap. The mapping is 20.5 GiB
+    # Keep true. false (emitted as --load-mode none; --no-mmap is gone
+    # upstream) would turn a reclaimable page cache into a hard resident
+    # allocation on a 16 GB node with no swap. The mapping is 20.5 GiB
     # now rather than 66.8, but it still exceeds what a non-reclaimable mapping
     # can survive here.
     use_mmap: true
@@ -165,13 +173,24 @@ model:
     flash_attention: true
 
     # f16, deliberately, not the q4_0 used by small single-node models. With
-    # flash attention on, quantized KV is legal — but there is nothing to buy:
-    # total KV is 2.50 GiB across three workers, so q8_0 would save ~170 MiB
-    # per node in exchange for a second quantization path through an RPC layer
-    # that performs no capability negotiation at all
-    # (ggml_backend_rpc_device_supports_op is a bare `return true`, so an op a
-    # worker cannot execute is a GGML_ASSERT and a dead socket, not a fallback).
-    # Revisit only if parallel_slots or context grow.
+    # flash attention on, quantized KV is legal, and q8_0 WOULD save real
+    # memory — about 1.17 GiB per group (0.35 / 0.47 / 0.35 GiB per worker at
+    # 131072 ctx, i.e. 2.50 GiB x (1 - 8.5/16)), not the ~170 MiB an earlier
+    # version of this comment claimed. It is still not worth it here, for two
+    # reasons read out of the llama.cpp source at b10375 (not re-read at the
+    # current pin, b11429):
+    #   - a quantized KV disables the CPU flash-attention kernel's split-KV
+    #     decode path and its tiled prefill path (both accept only f16/f32
+    #     caches), so every full-attention layer takes the slow generic path;
+    #   - it switches on Hadamard rotation inputs (k_rot 256x256 f32, v_rot
+    #     64x64 f32 = 272 KiB) that the head re-sends to EVERY worker on EVERY
+    #     token, ~816 KiB per group per token on top of the 1 MB it moves now.
+    # The RPC layer also performs no capability negotiation at all
+    # (ggml_backend_rpc_device_supports_op is a bare `return true` — still so
+    # at b11429 — so an op a worker cannot execute is a GGML_ASSERT and a dead
+    # socket, not a fallback).
+    # Revisit only if memory becomes binding (a larger quant, more slots), and
+    # measure decode at depth before and after.
     cache_type_k: "f16"
     cache_type_v: "f16"
 
@@ -208,9 +227,10 @@ model:
     # separately credentialed and rotating one leaves the other alone. The key
     # travels as LLAMA_API_KEY, never as argv.
     #
-    # /health, /v1/health, /models, /v1/models and the web-UI assets stay
-    # public; /props, /metrics, /slots, /completion and every /v1/* inference
-    # route need `Authorization: Bearer <key>`. Delete this line to serve the
+    # /health, /v1/health, / and the web-UI assets stay public; /models and
+    # /v1/models (exempt only through b10375 — the pinned b11429 gates them),
+    # /props, /metrics, /slots, /completion and every /v1/* inference route
+    # need `Authorization: Bearer <key>`. Delete this line to serve the
     # group open — which is what the 122B rollback target
     # (aureax-shard-head.yaml) does, having no api_key at all.
     #
@@ -226,23 +246,76 @@ model:
     # The model id /v1/models and /props report, and therefore the id a harness
     # (aider, Continue, Open WebUI) is configured with. Unset, llama-server
     # reports the GGUF's full path and users have to type it verbatim.
-    # NO COMMAS: b10375 parses --alias as a comma-separated LIST of aliases.
+    # NO COMMAS: the pinned build parses --alias as a comma-separated LIST of aliases.
     alias: "qwen3.5-35b-a3b"
 
-    # Keeps sampling on the compute device rather than shipping 248,320 f32
-    # logits (993 KB) back to the head over a blocking RPC round trip every
-    # token.
+    # Moves the sampler chain onto the device that holds the output tensor —
+    # the last RPC worker — so that the 248,320 f32 logits (993,280 B) need not
+    # come back to the head over a blocking RPC round trip every token.
     #
-    # Expect a small win, not a large one: the readback is ~1% of this model's
-    # per-token time budget, and llama.cpp silently falls back to host sampling
-    # for any request carrying tools or a json_schema — which `jinja: true`
-    # above makes common. Measure it rather than assuming it.
+    # ON ITS OWN IT DOES NOT DO THAT. Read from the llama.cpp source at the
+    # pinned build (b11429, unchanged since b10375; src/llama-sampler.cpp):
+    # only the longest PREFIX of
+    # the sampler chain whose samplers have a backend implementation runs on
+    # the device, and llama-server's default chain starts `penalties, dry, ...`
+    # where `dry` has none. The prefix therefore ends after `penalties`, whose
+    # output is a full-vocabulary tensor that the context copies back to the
+    # host with stride n_vocab — the same 993,280 B per token as the raw path.
+    # `samplers` below is what makes this flag earn its keep.
+    #
+    # Size the win honestly: the readback is about 8.4 ms per token on 1 GbE,
+    # roughly 6% of a ~150 ms token at the derived decode roofline (the earlier
+    # "~1%" here was wrong), and about 26% of a token over WiFi. llama.cpp
+    # also disables it per request for anything carrying a grammar — tools or
+    # a json_schema, which `jinja: true` above makes common — and for
+    # n_probs > 0, so MCP run_inference and plain completions gain, tool calls
+    # do not. Measure it with scripts/bench-decode.sh and HEAD_SSH set: the
+    # head NIC's bytes per decoded token should drop from ~1 MB to well under
+    # 0.1 MB once both this flag and the chain below are in place.
     backend_sampling: true
+
+    # The sampler chain, in order. Every entry has a backend implementation at
+    # the pinned build (penalties, top_k, top_p, min_p, temperature do; dry,
+    # top_n_sigma, typ_p, xtc, infill, adaptive_p do not), so with
+    # backend_sampling on the whole chain runs on the last worker and only the
+    # sampled token and its top-k probabilities return. `penalties` is left
+    # out because its default repeat penalty of 1.0 is a no-op, and because it
+    # refuses the backend path whenever a verify batch carries more than one
+    # output per sequence — which is exactly the speculative-decoding case
+    # below. A client can still ask for any sampler per request through the
+    # API's `samplers` field; such a request simply pays the full readback.
+    samplers: [top_k, top_p, min_p, temperature]
+
+    # llama-server's prompt cache for DISPLACED slots, in MiB. 0 = off, and it
+    # must stay 0 on this build: saving a slot's prompt state pulls its whole
+    # KV cache and recurrent state back from the RPC workers into head RAM
+    # (~20 KiB per token plus ~63 MiB per sequence: ~700 MiB at 32k, ~2.6 GiB
+    # at 128k), llama.cpp's default cap is 8192 MiB that daemonset-edge.yaml's
+    # 12Gi limit never budgeted, and — the part that decides it — at b10375
+    # the save path ABORTED llama-server over RPC the first time a request was
+    # large enough to trigger it (upstream issue #26529, closed not-planned;
+    # `--cache-ram 0` is the documented workaround). Whether the pinned b11429
+    # still aborts is unconfirmed, so this stays 0. Reinstating a bounded
+    # cache needs that confirmed on the fleet first, then measured.
+    cache_ram_mib: 0
+
+    # Context checkpoints per slot. This model is hybrid (30 recurrent layers),
+    # and a recurrent model cannot resume a shared prompt prefix without a
+    # checkpoint at or before the divergence point — a multi-turn chat that
+    # resends the whole conversation re-prefills from token zero otherwise, at
+    # a prefill rate of tens of tokens per second. Each checkpoint costs the
+    # sequence's ~63 MiB recurrent state in head RAM and one state pull from
+    # the workers when it is taken; llama.cpp's default of 32 is ~2 GiB per
+    # slot of unbudgeted head memory. 8 keeps ~0.5 GiB and covers a chat.
+    ctx_checkpoints: 8
 
     # Cold load ships every tensor to the workers over the LAN. Measured at
     # ~17 s/GB on this fleet (15.7 GB took 272 s), and flat in peer count
     # because the head ships the same total bytes either way — so 22.02 GB is
-    # ~380 s regardless of the 7-to-3 worker change.
+    # ~380 s regardless of the 7-to-3 worker change. A WARM load (the workers'
+    # content-addressed tensor cache already holds the shares, whether from a
+    # previous run or seeded with scripts/seed-rpc-cache.py) measured ~107 s;
+    # this budget covers the cold case so a fresh node still comes up.
     #
     # 900 rather than a tighter ~600 because two costs here are UNMEASURED: the
     # 2.50 GiB KV plus ~1.5 GiB of compute buffers now allocate over three
@@ -301,36 +374,57 @@ model:
 
   # --------------------------------------------------------------------------
   # Speculative decoding. The 0.8B draft proposes tokens and the target verifies
-  # a batch of them in ONE forward pass, so the target's weights are read once
-  # per accepted batch instead of once per token.
+  # a batch of them in ONE forward pass, so the target's dense weights are read
+  # once per accepted batch instead of once per token — and on this pipeline
+  # every verified batch also saves its share of the three blocking RPC round
+  # trips and the logits readback that every single token pays today.
   #
-  # DO NOT ENABLE THIS AT 131072 CONTEXT. The blocker is the context, not the
-  # quant:
+  # IT HAS NEVER RUN ON THIS FLEET. The earlier measurement recorded here
+  # ("decode within noise, prefill 43% worse, `loading draft model` and then no
+  # acceptance statistics") was taken on the 122B group and measured a LOADED,
+  # UNUSED draft: the client emitted the --spec-draft-* flags without
+  # --spec-type, and at b10375 (as at the current pin, b11429) the default
+  # type list is {none}, so llama-server loads the draft and creates no
+  # speculator at all.
+  # client/config/parser.py now emits --spec-type from `type` below, which is
+  # why that result says nothing about what speculation would do here.
   #
-  #   get_llama_server_args emits --spec-draft-model/-n-max/-n-min/-p-min/-ngl
-  #   /-threads but NO draft context size, so the draft inherits the target's
-  #   n_ctx. Qwen3.5-0.8B is DENSE, so its KV is O(all layers) rather than the
-  #   target's 10-of-40 — plausibly 6-14 GiB at 131072. And gpu_layers: 0 below
-  #   is correct and must stay, which means every byte of that lands on the
-  #   HEAD, whose pod limit is 12Gi. It would OOM the head at load.
+  # Why it stays off until measured:
+  #   - No draft context-size flag existed at b10375, and none has been
+  #     confirmed at b11429 (the "--spec-draft-c" an
+  #     earlier version of this comment named does not exist), so the dense
+  #     0.8B draft inherits the target's 131072 n_ctx and its KV cache lands on
+  #     the HEAD (gpu_layers: 0 and devices: none below are correct and must
+  #     stay). How large that is has not been measured; the head pod's limit
+  #     is 12Gi. Check head RSS during the first run before leaving it on.
+  #   - The gain is an acceptance-rate bet: derived from the per-token byte
+  #     counts, n_max 2 is worth roughly +10% to +50% decode at acceptance
+  #     0.7-0.85 and NEGATIVE below about 0.6, because a verify batch of n+1
+  #     tokens touches up to (n+1) x 8 experts per layer on this MoE and, with
+  #     a chain that is not fully backend-capable, fetches n+1 logits rows.
+  #     Keep `samplers` above as it is (penalties excluded) for exactly that
+  #     reason, and keep n_max small.
+  #   - Vocabulary is NOT a guard: Qwen3.5-35B-A3B and this draft share the
+  #     248320-token vocabulary, so llama-server loads it happily.
   #
-  # Vocabulary is NOT the guard here. Qwen3.5-35B-A3B is vocab_size 248320,
-  # identical to the 122B and to this draft, so llama-server would load it
-  # happily and then die on memory.
-  #
-  # Enabling it safely needs a draft.context_size knob emitting --spec-draft-c
-  # first. Until that exists, this stays false.
-  #
-  # Measurement on this fleet is further reason not to bother: a sharded head
-  # with speculation on measured decode within noise and prefill 43% WORSE,
-  # with llama-server logging `loading draft model` and then no acceptance
-  # statistics at all — paid for, not used. A 3B-active target is also a weak
-  # case for speculation, since the per-token cost being amortised is small.
+  # How to measure (one group, the other left as control): set enabled: true,
+  # n_max: 2, re-run scripts/bench-decode.sh against the baseline, and read
+  # the acceptance rate and tokens-per-step from llama-server's timings. Below
+  # ~0.6 acceptance, turn it back off and record the number here.
   #
   # The GGUF and the registry entry both stay; only the feature is off.
   draft:
     enabled: false
+    # --spec-type. draft-simple = this separate draft file; draft-mtp = the
+    # model's own multi-token-prediction head, which needs the 41-block MTP
+    # GGUF (unsloth/Qwen3.5-35B-A3B-MTP-GGUF) instead of this file and has no
+    # published CPU-only figure yet.
+    type: "draft-simple"
     filename: "Qwen3.5-0.8B-Q4_K_M.gguf"
+    # --spec-draft-device. Empty emits `none`: the draft stays off every
+    # accelerator, the RPC workers included, whatever device list the target
+    # was offered.
+    devices: []
     n_max: 4
     n_min: 1
     p_min: 0.6

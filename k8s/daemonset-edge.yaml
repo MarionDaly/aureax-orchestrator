@@ -61,8 +61,9 @@ spec:
       #     aureax-planner.yaml, plus the standalone aureax-edge.yaml), but the
       #     frozen 122B rollback target aureax-shard-head.yaml has none and
       #     genuinely serves open — so this is a per-node property, not a
-      #     fleet-wide one. /health, /v1/health, /models, /v1/models and the
-      #     web-UI assets stay public even with a key set. CORS is left
+      #     fleet-wide one. /health, /v1/health, / and the web-UI assets stay
+      #     public even with a key set; /models and /v1/models need the key on
+      #     the pinned build (b11429 — exempt only through b10375). CORS is left
       #     permissive (LlamaServerConfig.cors_origins defaults to omitting the
       #     flag, i.e. llama.cpp's own '*').
       #   :9000 — bearer auth, IF AND ONLY IF the node's resolved config carries

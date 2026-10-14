@@ -1549,7 +1549,7 @@ _BUILD_GATE_TIMEOUT = 60
 
 
 def _assert_group_builds_match(config, log: SystemLogger) -> None:
-    """Fail the start if a group's members run different llama.cpp binaries.
+    """Fail the start if a group's members run different llama.cpp builds.
 
     This is the "hangs at the RPC handshake" failure made loud. The wire format
     is version-locked, so a head that dials a peer built from another commit
@@ -1557,15 +1557,20 @@ def _assert_group_builds_match(config, log: SystemLogger) -> None:
     edge pod sitting 0/1 Running until its startupProbe budget (3015s) expires —
     50 minutes of looking like a slow model load.
 
-    Compares the sha256 of ``llama-server`` and ``rpc-server`` INSIDE each
-    member's image, over SSH, not the pods' image digests. The digest version of
+    Asks each member's IMAGE, over SSH, for the llama.cpp commit it was built
+    from, its architecture and the sha256 of ``llama-server`` and
+    ``rpc-server``: the commit must be the head's on every member, and the
+    binaries must be the head's on every member of the head's architecture (an
+    aarch64 and an x86_64 image are never byte-identical, and the protocol is
+    architecture-neutral). Not the pods' image digests — the digest version of
     this gate failed every start on the real fleet: every node builds
     ``aureax-client:dev`` natively (scripts/build-on-node.sh), so the digests
     differ by construction while the binaries are identical. See
     ``orchestrator/cluster/buildcheck.py`` for the full account.
 
     Fails OPEN on a member that could not be probed — an SSH blip must not
-    refuse a start — and CLOSED on two checksums that differ.
+    refuse a start — and CLOSED on two commits or two same-architecture
+    checksums that differ.
     """
     if not config.node_groups:
         return
@@ -1603,7 +1608,8 @@ def _assert_group_builds_match(config, log: SystemLogger) -> None:
         for problem in problems:
             log.emit("error", f"  {problem}")
         raise RuntimeError(
-            "the members of a sharded group do not run the same llama.cpp binaries:\n  "
+            "the members of a sharded group do not run the same llama.cpp build (one "
+            "commit everywhere, identical binaries within the head's architecture):\n  "
             + "\n  ".join(problems)
         )
 
@@ -1618,9 +1624,9 @@ def _start_phase_label_and_wait_pods(
     """Label nodes and wait for pods, in dependency order.
 
     Sequencing is load-bearing throughout:
-      A-. the group build gate — a group whose members run different llama.cpp
-          binaries hangs at the RPC handshake, so it must be caught before
-          anything is labelled or scheduled.
+      A-. the group build gate — a group whose members were built from
+          different llama.cpp commits hangs at the RPC handshake, so it must be
+          caught before anything is labelled or scheduled.
       A0. shard workers — a head's llama-server exits immediately if an RPC
           peer is unreachable at load time, so workers must be Ready first.
       A.  edges/heads — the model load itself.

@@ -342,9 +342,10 @@ file_size() {
 # and a mismatched RPC build HANGS at the handshake rather than erroring.
 #
 # The x86-without-GPU case FAILS rather than falling through to the CPU file:
-# docker/Dockerfile.client hard-codes -DGGML_CPU_AARCH64=ON and an ARM ISA
-# baseline (armv8.2-a+fp16+dotprod), so building it on x86_64 yields a broken
-# image, and a broken image on one group member is that same silent hang.
+# docker/Dockerfile.client hard-codes an ARM ISA baseline
+# (-DGGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod), so building it on x86_64
+# yields a broken image, and a broken image on one group member is that same
+# silent hang.
 #
 # Returns 1 rather than exiting, so a caller that builds several nodes
 # concurrently decides for itself whether one bad node aborts the run.
@@ -356,7 +357,7 @@ pick_dockerfile() {
             if [ "$has_nvidia" = "yes" ]; then
                 echo "docker/Dockerfile.client.cuda"
             else
-                fail "$host" "x86_64 without an NVIDIA GPU has no Dockerfile — docker/Dockerfile.client is ARM-only (GGML_CPU_AARCH64 + armv8.2 baseline). Add an x86 CPU Dockerfile before deploying this node." >&2
+                fail "$host" "x86_64 without an NVIDIA GPU has no Dockerfile — docker/Dockerfile.client is ARM-only (armv8.2-a ISA baseline). Add an x86 CPU Dockerfile before deploying this node." >&2
                 return 1
             fi
             ;;

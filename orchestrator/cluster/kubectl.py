@@ -214,13 +214,14 @@ def delete_pods_on_node(namespace: str, node_name: str) -> tuple[bool, str]:
 
     The app label is fixed, not a parameter: the only other value in the fleet
     is aureax-shard, and restarting a shard worker tears its group down and
-    invalidates the tensor cache the head depends on (see ARCHITECTURE.md,
-    "3. Sharded model groups (llama.cpp RPC)") — so apply_to_nodes skips
-    workers entirely rather than passing a different app.
+    forces the head to reload (warm, from the worker's tensor cache, but still
+    minutes; see ARCHITECTURE.md, "3. Sharded model groups (llama.cpp RPC)")
+    — so apply_to_nodes skips workers entirely rather than passing a different
+    app.
 
     This is the ONLY restart primitive the apply path may use. `kubectl
     rollout restart daemonset/...` restarts every pod in the fleet — serially —
-    for a change to one node, which on a sharded head means minutes of cold
+    for a change to one node, which on a sharded head means minutes of
     reload per member (tests/test_apply.py pins that it is never invoked).
     """
     result = _run([

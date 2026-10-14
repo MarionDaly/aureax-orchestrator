@@ -21,9 +21,15 @@ an authorization mechanism for local programs or LAN clients. Do not expose the 
 untrusted clients. API responses, including key reveals, are marked `no-store`.
 
 Node llama-server and MCP keep their separate TLS and bearer checks. RPC is plaintext and
-unauthenticated. Its init container must install and verify the per-head host firewall rules for
-every IP family the host has, before the worker starts. Preserve those rules while RPC runs; a
-host firewall reset requires stopping workers and recreating their pods. The runtime containers run as root
+unauthenticated. A node group can carry it over a WireGuard tunnel (`node_groups[].wireguard.enabled`):
+each worker's RPC server then binds only its tunnel address and accepts only the head's tunnel
+address on the tunnel interface, so the control is WireGuard's key authentication, with the host
+firewall as a second layer. Without the tunnel the host firewall is the control. Either way, the
+worker's init container must install and verify the per-head host firewall rules for every IP
+family the host has, before the worker starts. Preserve those rules while RPC runs; a
+host firewall reset requires stopping workers and recreating their pods. The tunnel authenticates
+the head's key, not the RPC protocol: root on a head, or that head's WireGuard private key, still
+reaches every worker in its group. The runtime containers run as root
 with host networking, PID visibility and persistent mounts, so they do not provide strong
 isolation from a compromised node.
 

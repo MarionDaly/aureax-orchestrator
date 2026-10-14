@@ -6,6 +6,12 @@ real fleet — each node builds `aureax-client:dev` natively, so the digests
 differ by construction while the binaries do not. So two properties are pinned
 as hard as the mismatch itself: identical binaries pass, and a member that
 could not be READ is a note rather than a refusal.
+
+Two scopes since a CUDA x86_64 member may join an aarch64 group: the llama.cpp
+commit must match the head's on every member (the RPC protocol is a property
+of the commit, and architecture-neutral), and the binaries must match the
+head's only within the head's architecture — the two images can never be
+byte-identical.
 """
 
 from __future__ import annotations
@@ -17,6 +23,10 @@ _SHA_LLAMA = "a" * 64
 _SHA_RPC = "b" * 64
 _SHA_OTHER_LLAMA = "c" * 64
 _SHA_OTHER_RPC = "d" * 64
+# The llama.cpp commit every fixture member was built from unless a test says
+# otherwise, and one it was not.
+_COMMIT = "0f1e2d3c"
+_COMMIT_OTHER = "9a8b7c6d"
 
 
 def _group(*workers: str, name: str = "g", head: str = "h"):
@@ -27,12 +37,19 @@ def _group(*workers: str, name: str = "g", head: str = "h"):
     return cfg.node_groups[0], cfg
 
 
-def _facts(llama: str = _SHA_LLAMA, rpc: str = _SHA_RPC, host: str = "10.77.0.1") -> dict:
+def _facts(llama: str = _SHA_LLAMA, rpc: str = _SHA_RPC, host: str = "10.77.0.1",
+           commit: str | None = _COMMIT, arch: str = "aarch64") -> dict:
+    """One member's probe facts. ``commit=None`` is an image whose build record
+    could not be read — the probe's own fallback text, verbatim."""
     return {
         buildcheck.HOST_KEY: host,
         buildcheck.LLAMA_SHA_KEY: llama,
         buildcheck.RPC_SHA_KEY: rpc,
-        buildcheck.BUILD_KEY: '{"version":"b10375","commit":"0f1e2d3c"}',
+        buildcheck.BUILD_KEY: (
+            f'{{"version":"b10375","commit":"{commit}"}}' if commit is not None
+            else buildcheck.BUILD_UNAVAILABLE
+        ),
+        buildcheck.ARCH_KEY: arch,
         buildcheck.ERROR_KEY: "",
     }
 
@@ -164,6 +181,182 @@ def test_a_single_member_that_answered_is_not_called_consistent() -> None:
     assert not any(n.startswith("OK ") for n in notes), notes
 
 
+# --- commit fleet-wide, binaries within one architecture --------------------
+# A CUDA x86_64 member may join an aarch64 group: the RPC protocol is a property
+# of the llama.cpp commit and its structs are packed little-endian, so it is
+# architecture-neutral — but two architectures' binaries can never be
+# byte-identical, so across them the commit is the whole comparison.
+
+def test_a_same_commit_member_of_another_architecture_passes_on_the_commit() -> None:
+    """The case this split exists for. Comparing bytes across architectures
+    would refuse every mixed group, however carefully it was built."""
+    group, _cfg = _group("w1", "gpu")
+
+    problems, notes = buildcheck.compare_group(
+        group,
+        {
+            "h": _facts(),
+            "w1": _facts(),
+            "gpu": _facts(llama=_SHA_OTHER_LLAMA, rpc=_SHA_OTHER_RPC, arch="x86_64"),
+        },
+    )
+
+    assert problems == [], problems
+    assert (
+        f"OK   gpu: x86_64 member compared by commit: same commit {_COMMIT} as head h (aarch64)"
+        in notes
+    ), notes
+    assert any(
+        n.startswith("OK   llama-server/rpc-server checksums identical on every aarch64 member (2/3")
+        for n in notes
+    ), "the bytes were still compared among the head's architecture, and the line says whose"
+    assert any(n.startswith(f"OK   llama.cpp commit {_COMMIT} identical on every member (3/3")
+               for n in notes), notes
+
+
+def test_a_member_of_another_architecture_on_another_commit_fails_naming_both() -> None:
+    """Architecture moves a member onto the commit-only comparison; it never
+    exempts it from the version lock."""
+    group, _cfg = _group("w1", "gpu")
+
+    problems, _notes = buildcheck.compare_group(
+        group,
+        {
+            "h": _facts(host="10.77.0.1"),
+            "w1": _facts(host="10.77.0.2"),
+            "gpu": _facts(llama=_SHA_OTHER_LLAMA, rpc=_SHA_OTHER_RPC, host="10.77.0.3",
+                          commit=_COMMIT_OTHER, arch="x86_64"),
+        },
+    )
+
+    assert len(problems) == 1, problems
+    problem = problems[0]
+    assert problem.startswith(f"FAIL gpu: llama.cpp commit {_COMMIT_OTHER} does not match head h's "
+                              f"{_COMMIT}"), problem
+    assert "x86_64" in problem and "aarch64" in problem
+    assert "HANGS at the handshake" in problem
+    assert "./scripts/build-on-node.sh 10.77.0.3" in problem
+    assert "./scripts/update-all.sh" in problem
+
+
+def test_a_same_architecture_member_with_different_binaries_still_fails() -> None:
+    """Within one architecture the bytes stay the check, commit or no commit: a
+    matching commit with different binaries is a different toolchain, flags or
+    tree, and the message says that rather than blaming the version."""
+    group, _cfg = _group("w1")
+
+    problems, _notes = buildcheck.compare_group(
+        group, {"h": _facts(), "w1": _facts(rpc=_SHA_OTHER_RPC, host="10.77.0.2")}
+    )
+
+    assert len(problems) == 1, problems
+    problem = problems[0]
+    assert problem.startswith("FAIL w1: llama-server/rpc-server do not match head h"), problem
+    assert _SHA_RPC[:12] in problem and _SHA_OTHER_RPC[:12] in problem
+    assert f"Both report llama.cpp commit {_COMMIT}" in problem
+    assert "./scripts/build-on-node.sh 10.77.0.2" in problem and "./scripts/update-all.sh" in problem
+
+
+def test_a_member_with_no_build_record_but_matching_binaries_passes_with_a_note() -> None:
+    """An unreadable build record is a note, exactly as an unreadable checksum
+    is — and the binaries it did report were still compared."""
+    group, _cfg = _group("w1")
+
+    problems, notes = buildcheck.compare_group(
+        group, {"h": _facts(), "w1": _facts(commit=None)}
+    )
+
+    assert problems == [], problems
+    skip = [n for n in notes if n.startswith("SKIP w1:")]
+    assert len(skip) == 1, notes
+    assert "llama.cpp commit could not be read" in skip[0]
+    assert buildcheck.BUILD_UNAVAILABLE in skip[0], "the probe's own words reach the note"
+    assert any(n.startswith("OK   llama-server/rpc-server checksums identical on every member")
+               for n in notes), notes
+
+
+def test_a_different_commit_with_identical_binaries_fails_on_the_commit() -> None:
+    """Impossible in practice, but it pins which check wins: the commit is the
+    version lock, so a disagreement there is the member's one FAIL, and the
+    matching bytes do not argue it away."""
+    group, _cfg = _group("w1")
+
+    problems, notes = buildcheck.compare_group(
+        group, {"h": _facts(), "w1": _facts(commit=_COMMIT_OTHER)}
+    )
+
+    assert len(problems) == 1, problems
+    assert problems[0].startswith("FAIL w1: llama.cpp commit"), problems[0]
+    assert "do not match head" not in problems[0], "the binaries check must not be the one reported"
+    assert not any(n.startswith("OK ") for n in notes), notes
+
+
+def test_a_member_with_a_commit_but_no_checksums_is_held_to_the_commit() -> None:
+    """Readable commit, unreadable binaries: compared by commit alone, so a
+    commit mismatch still fails and a matching one is a note, not a refusal."""
+    group, _cfg = _group("w1", "w2")
+    unread = _facts(llama="", rpc="", commit=_COMMIT)
+    unread[buildcheck.ERROR_KEY] = "sha256sum: /usr/local/bin/rpc-server: No such file"
+    odd = _facts(llama="", rpc="", commit=_COMMIT_OTHER, host="10.77.0.3")
+
+    problems, notes = buildcheck.compare_group(group, {"h": _facts(), "w1": unread, "w2": odd})
+
+    assert len(problems) == 1 and problems[0].startswith("FAIL w2: llama.cpp commit"), problems
+    w1_notes = [n for n in notes if n.startswith("SKIP w1:")]
+    assert len(w1_notes) == 1, notes
+    assert "did not cover this node's binaries" in w1_notes[0]
+    assert "No such file" in w1_notes[0], "the reason has to survive into the note"
+
+
+def test_an_unreported_architecture_never_relaxes_the_binary_check() -> None:
+    """Only a KNOWN other architecture moves a member onto the commit-only
+    comparison. A lost `uname -m` must not turn a same-architecture mismatch
+    into a pass — the check this change must not weaken."""
+    group, _cfg = _group("w1")
+
+    problems, _notes = buildcheck.compare_group(
+        group, {"h": _facts(), "w1": _facts(rpc=_SHA_OTHER_RPC, arch="")}
+    )
+
+    assert len(problems) == 1, problems
+    assert problems[0].startswith("FAIL w1: llama-server/rpc-server do not match head h")
+    assert "Image architecture unreported for w1" in problems[0]
+
+
+def test_another_architecture_with_no_commit_is_uncompared_not_failed() -> None:
+    """Across architectures the commit is the only comparable fact. Without it
+    the member is UNKNOWN — said out loud, never a pass and never a refusal."""
+    group, _cfg = _group("gpu")
+
+    problems, notes = buildcheck.compare_group(
+        group,
+        {"h": _facts(), "gpu": _facts(llama=_SHA_OTHER_LLAMA, commit=None, arch="x86_64")},
+    )
+
+    assert problems == [], problems
+    assert any(
+        n.startswith("SKIP gpu: not compared — it is x86_64 and head h is aarch64")
+        and "UNKNOWN" in n
+        for n in notes
+    ), notes
+    assert not any(n.startswith("OK ") for n in notes), notes
+
+
+def test_a_head_whose_binaries_were_unreadable_still_anchors_the_commit() -> None:
+    """The head is the reference for both checks separately: losing its bytes
+    leaves the commit comparison standing."""
+    group, _cfg = _group("w1")
+    head = _facts(llama="", rpc="")
+    head[buildcheck.ERROR_KEY] = "sudo: a password is required"
+
+    problems, notes = buildcheck.compare_group(
+        group, {"h": head, "w1": _facts(commit=_COMMIT_OTHER, host="10.77.0.2")}
+    )
+
+    assert len(problems) == 1 and problems[0].startswith("FAIL w1: llama.cpp commit"), problems
+    assert any("head h's binaries could not be read" in n for n in notes), notes
+
+
 # --- checksums ---------------------------------------------------------------
 
 def test_only_sixty_four_hex_digits_count_as_a_checksum() -> None:
@@ -174,6 +367,32 @@ def test_only_sixty_four_hex_digits_count_as_a_checksum() -> None:
     assert buildcheck.checksums(_facts(llama=("A" * 64))) is None, "sha256sum prints lower case"
     assert buildcheck.checksums({}) is None
     assert buildcheck.checksums(None) is None
+
+
+def test_only_a_recorded_commit_counts_as_a_commit() -> None:
+    """The fallback text and a record with no commit are unreadable, never a
+    commit — a mismatch built from either would send the operator rebuilding
+    an image to fix a probe."""
+    assert buildcheck.llama_commit(_facts()) == _COMMIT
+    assert buildcheck.llama_commit(_facts(commit=None)) is None
+    assert buildcheck.llama_commit({buildcheck.BUILD_KEY: '{"version":"b10375"}'}) is None
+    assert buildcheck.llama_commit({buildcheck.BUILD_KEY: '{"commit":"not-a-sha"}'}) is None
+    assert buildcheck.llama_commit({buildcheck.BUILD_KEY: '["0f1e2d3c"]'}) is None
+    assert buildcheck.llama_commit({buildcheck.BUILD_KEY: '{"commit":"0F1E2D3C"}'}) == "0f1e2d3c"
+    # Extra fields are ignored: a record that also carries rpc_proto still yields its commit.
+    assert buildcheck.llama_commit(
+        {buildcheck.BUILD_KEY: '{"version":"b10375","commit":"0f1e2d3c","rpc_proto":"3.0.0"}'}
+    ) == "0f1e2d3c"
+    assert buildcheck.llama_commit({}) is None
+    assert buildcheck.llama_commit(None) is None
+
+
+def test_only_a_uname_shaped_value_counts_as_an_architecture() -> None:
+    assert buildcheck.image_arch(_facts(arch="x86_64")) == "x86_64"
+    assert buildcheck.image_arch(_facts(arch="aarch64")) == "aarch64"
+    assert buildcheck.image_arch(_facts(arch="")) is None
+    assert buildcheck.image_arch(_facts(arch="sh: uname: not found")) is None
+    assert buildcheck.image_arch(None) is None
 
 
 # --- probe_member / probe_group ---------------------------------------------
@@ -204,11 +423,13 @@ def _fake_run_command(monkeypatch, answer):
     return seen
 
 
-def _probe_stdout(llama: str = _SHA_LLAMA, rpc: str = _SHA_RPC, error: str = "") -> str:
+def _probe_stdout(llama: str = _SHA_LLAMA, rpc: str = _SHA_RPC, error: str = "",
+                  arch: str = "aarch64") -> str:
     return (
         f"{buildcheck.LLAMA_SHA_KEY}={llama}\n"
         f"{buildcheck.RPC_SHA_KEY}={rpc}\n"
         f'{buildcheck.BUILD_KEY}={{"version":"b10375","commit":"0f1e2d3c"}}\n'
+        f"{buildcheck.ARCH_KEY}={arch}\n"
         f"{buildcheck.ERROR_KEY}={error}\n"
     )
 
@@ -218,6 +439,29 @@ def test_probe_member_parses_the_two_checksums_and_the_build() -> None:
 
     assert buildcheck.checksums(facts) == (_SHA_LLAMA, _SHA_RPC)
     assert facts[buildcheck.BUILD_KEY] == '{"version":"b10375","commit":"0f1e2d3c"}'
+
+
+def test_probe_member_parses_the_image_architecture() -> None:
+    facts = buildcheck.parse_probe(_probe_stdout(arch="x86_64"))
+
+    assert buildcheck.image_arch(facts) == "x86_64"
+    assert buildcheck.llama_commit(facts) == _COMMIT
+
+
+def test_the_architecture_is_read_in_the_same_container_start() -> None:
+    """One container start per member, still: `uname -m` runs INSIDE the image
+    beside the two sha256sums and the build record, and comes back tagged so an
+    error line can never read as an architecture. Not under the key `arch` —
+    the doctor's probe already prints the HOST's architecture under it, and the
+    spliced-in line would replace that fact."""
+    probe = buildcheck.BUILD_PROBE
+
+    assert probe.count("docker run") == 1
+    container_script = probe.split(" -c '", 1)[1].split("'", 1)[0]
+    assert "sha256sum /usr/local/bin/llama-server /usr/local/bin/rpc-server" in container_script
+    assert f"cat {buildcheck.BUILD_JSON_PATH}" in container_script
+    assert f'echo "{buildcheck.ARCH_KEY}=$(uname -m)"' in container_script
+    assert buildcheck.ARCH_KEY != "arch"
 
 
 def test_probe_member_reports_the_nodes_own_failure_text(monkeypatch) -> None:

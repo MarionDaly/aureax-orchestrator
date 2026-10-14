@@ -88,10 +88,12 @@ model:
     # reaches llama-server through the LLAMA_API_KEY environment variable, not
     # argv, so it stays out of `ps` and out of shipped logs.
     #
-    # /health, /v1/health, /models, /v1/models and the web-UI assets stay
-    # PUBLIC — the k8s probes and a harness's model-discovery call depend on
-    # that. /props, /metrics, /slots, /completion and every /v1/* inference
-    # route answer 401 without `Authorization: Bearer <key>`.
+    # /health, /v1/health, / and the web-UI assets stay PUBLIC — the k8s
+    # probes depend on /health. /models, /v1/models (exempt only through
+    # b10375; the pinned b11429 gates them), /props, /metrics, /slots,
+    # /completion and every /v1/* inference route answer 401 without
+    # `Authorization: Bearer <key>`, so a harness's model-discovery call needs
+    # the key too.
     #
     # TO DISABLE AUTH: delete this line. An absent api_key is no auth at all —
     # which is how the frozen 122B rollback configs stay open without an edit.

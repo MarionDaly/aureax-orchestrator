@@ -589,6 +589,45 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
     ok "Downloaded ${f} (${#parts[@]} part(s))"
 done
 
+# --- Step 2a: the rpc-cache manifest for every single-file head model ---
+# Each shard worker's supervisor audits its tensor cache against the manifest
+# the deployer installs beside its config (client/entrypoint.py). The manifest
+# is the GGUF's header, read in well under a second — every tensor over
+# rpc-server's 10 MiB cache threshold with its byte size — so it is cheap to
+# keep current here, right after the file it describes was verified. Sizes
+# only: the content hashes that let scripts/seed-rpc-cache.py pre-populate a
+# worker's cache are a separate, slower `manifest --hash` run.
+#
+# Split models are skipped: their tensors live across parts and a per-part
+# manifest is not what the worker expects. Their workers audit report-only.
+SEEN_MANIFESTS=" "
+for i in $(seq 0 $((NODE_COUNT - 1))); do
+    f="${NODE_MODEL_FILENAME[$i]}"
+    [ -z "$f" ] && continue
+    case "$SEEN_MANIFESTS" in
+        *" $f "*) continue ;;
+    esac
+    SEEN_MANIFESTS="${SEEN_MANIFESTS}${f} "
+    read -r -a parts <<< "${NODE_MODEL_PARTS[$i]}"
+    if [ "${#parts[@]}" -ne 1 ]; then
+        info "${f}: split into ${#parts[@]} parts — no rpc-cache manifest (workers audit report-only)"
+        continue
+    fi
+    gguf_path="${LOCAL_MODEL_DIR}/${f}"
+    manifest_path="${gguf_path}.rpc-manifest.json"
+    if [ -f "$manifest_path" ] && [ ! "$gguf_path" -nt "$manifest_path" ]; then
+        ok "${f}: rpc-cache manifest current"
+        continue
+    fi
+    # python3 rather than `uv run`: the tool is standard-library only, and
+    # this script already requires python3 for the registry parse.
+    if python3 "${PROJECT_DIR}/scripts/seed-rpc-cache.py" manifest "$gguf_path" --out "$manifest_path" >/dev/null; then
+        ok "${f}: rpc-cache manifest written ($(basename "$manifest_path"))"
+    else
+        fail "${f}" "could not write the rpc-cache manifest — workers will audit their cache report-only"
+    fi
+done
+
 # --- Step 2b: the same, for any speculative-decoding draft model ---
 # Always single-file (a sub-1 GB GGUF is never published split), so this skips
 # the multi-part machinery above and checks one size — and one digest, when
@@ -649,8 +688,10 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
     KEY="${NODE_KEY_FILES[$i]}"
     f="${NODE_MODEL_FILENAME[$i]}"
 
-    # Skipped in Step 1 — a shard worker holds its share of the weights in RAM,
-    # shipped from the head at load time, never on local disk.
+    # Skipped in Step 1 — a shard worker is never pushed a model file: the head
+    # ships its share of the weights at load time. That share does then live on
+    # the worker's local disk, in rpc-server's tensor cache
+    # (model.rpc_server.cache_dir), which is what makes its next load warm.
     if [ -z "$f" ]; then
         ok "${HOST}: shard worker — no model push needed"
         continue

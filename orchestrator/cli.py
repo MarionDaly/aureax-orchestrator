@@ -761,15 +761,15 @@ def apply(ctx: click.Context, orchestrator_ip: str, node_ids: tuple[str, ...], a
     bearer to a server that has already stopped accepting it.
 
     Shard workers are pushed but never restarted — rpc-server takes no key,
-    and restarting one forces a cold group reload.
+    and restarting one forces a whole-group reload.
     """
     import logging
 
     from orchestrator.deploy.deployer import Deployer
 
     # Fleet-wide is opt-in, never the default: --all rotates every key it is
-    # given and restarts every head, so every sharded group reloads cold at
-    # once — and a rotation is recoverable only through the single .key.prev.
+    # given and restarts every head, so every sharded group reloads at once
+    # — and a rotation is recoverable only through the single .key.prev.
     if all_nodes and node_ids:
         raise click.UsageError("--all and --node are mutually exclusive")
     if not all_nodes and not node_ids:
@@ -1153,11 +1153,11 @@ def _ca_rotation_steps(orchestrator_ip: str, ca_path: Path) -> list[str]:
     Every step is here because something else caches the old root, and the
     documented pair (`regenerate --ca` then `apply --all`) leaves most of the
     fleet on it: `apply` restarts only heads and standalone nodes — a shard
-    worker is pushed but never restarted, because restarting one forces a cold
-    group reload — and every supervisor's telemetry and log reporter snapshots
-    its SSLContext when it starts. Their pushes then fail verification against
-    a dashboard serving the new leaf, at DEBUG level, so the only symptom is
-    those nodes quietly vanishing from the Overview tab.
+    worker is pushed but never restarted, because restarting one forces a
+    whole-group reload — and every supervisor's telemetry and log reporter
+    snapshots its SSLContext when it starts. Their pushes then fail
+    verification against a dashboard serving the new leaf, at DEBUG level, so
+    the only symptom is those nodes quietly vanishing from the Overview tab.
     """
     return [
         f"1. aureax apply --all --orchestrator-ip {orchestrator_ip}",
@@ -1269,6 +1269,104 @@ def tls_regenerate(ctx: click.Context, regenerate_ca: bool, node_ids: tuple[str,
         click.echo("A running `aureax dashboard` serves the old certificate until it is restarted.")
 
 
+# ---------------------------------------------------------------------------
+# aureax wg — the opt-in WireGuard transport for rpc-server
+# ---------------------------------------------------------------------------
+
+@cli.group("wg")
+def wg_group() -> None:
+    """Inspect and rotate the WireGuard keys that carry a group's RPC traffic."""
+
+
+@wg_group.command("status")
+@click.pass_context
+def wg_status(ctx: click.Context) -> None:
+    """Per group with wireguard enabled: subnet, every member's address and key.
+
+    Never mints anything — the rule `tls status` and the Access tab follow. A
+    member with no key is reported, and `aureax generate` is what mints it.
+    """
+    from orchestrator.config import wgstore
+
+    config = ctx.obj["network_config"]
+    click.echo(f"WireGuard store: {wgstore.store_dir()}")
+    if not config.node_groups:
+        click.echo("No node groups configured.")
+        return
+    for g in config.node_groups:
+        addresses = config.wireguard_addresses(g)
+        if addresses is None:
+            click.echo(
+                click.style(f"{g.name}", bold=True)
+                + "  [off] rpc travels the LAN, firewalled to the head "
+                "(set node_groups[].wireguard.enabled: true to tunnel it)"
+            )
+            continue
+        net = config.wireguard_network(g)
+        wg = g.wireguard
+        click.echo(
+            click.style(f"{g.name}", bold=True)
+            + f"  [on] subnet {net}  udp/{wg.listen_port}  mtu {wg.mtu}  "
+            f"keepalive {wg.persistent_keepalive}s"
+        )
+        for node_id in g.members:
+            role = "head" if node_id == g.head else "worker"
+            key_path, _pub_path = wgstore.key_paths(node_id)
+            try:
+                pub = wgstore.public_key(node_id)
+            except ValueError as e:
+                pub_text = click.style(f"unreadable: {e}", fg="red")
+            else:
+                pub_text = pub if pub else click.style(
+                    "no key — run `aureax generate --orchestrator-ip <ip>`", fg="yellow")
+            key_file = (click.style("present", fg="green") if key_path.exists()
+                        else click.style("absent", fg="yellow"))
+            click.echo(f"  {role:7s} {node_id:14s} {addresses[node_id]:15s} key file {key_file}")
+            click.echo(f"  {'':7s} {'':14s} public key {pub_text}")
+
+
+@wg_group.command("regenerate")
+@click.option("--node", "node_ids", multiple=True, required=True,
+              help="Rotate this member's WireGuard key pair (repeatable).")
+@click.pass_context
+def wg_regenerate(ctx: click.Context, node_ids: tuple[str, ...]) -> None:
+    """Replace a member's WireGuard key pair; the old private key is kept as .key.prev.
+
+    Only members of a group with wireguard enabled have a pair, so any other
+    node id is refused before anything is written. The rotation reaches the
+    tunnel only through the two steps printed afterwards.
+    """
+    from orchestrator.config import wgstore
+
+    config = ctx.obj["network_config"]
+    refused = []
+    for node_id in node_ids:
+        group = config.group_for_node(node_id)
+        if group is None or not group.wireguard.enabled:
+            refused.append(node_id)
+    if refused:
+        raise click.ClickException(
+            f"{', '.join(refused)}: not a member of a node group with wireguard.enabled — "
+            "only those carry a WireGuard key"
+        )
+
+    try:
+        for node_id in node_ids:
+            pub = wgstore.rotate_key(node_id)
+            click.echo(f"Rotated {node_id}: public key {pub}")
+    except (OSError, ValueError) as e:
+        raise click.ClickException(str(e)) from e
+
+    nodes = " ".join(f"--node {n}" for n in node_ids)
+    click.echo("Next, in order:")
+    click.echo(f"  1. aureax apply {nodes} --orchestrator-ip <ip>")
+    click.echo("       pushes the new wg0.conf to these nodes and the rest of their group (every")
+    click.echo("       peer carries the rotated public key) and restarts wg-quick@wg0 where it changed.")
+    click.echo("  2. aureax stop && aureax start")
+    click.echo("       apply never restarts a shard worker, and a worker's rpc-server still holding")
+    click.echo("       the old head connection refuses the new head until its pod is recreated.")
+
+
 @cli.group()
 def group() -> None:
     """Inspect sharded node groups."""
@@ -1293,6 +1391,16 @@ def group_list(ctx: click.Context) -> None:
         click.echo(f"  head:    {g.head:14s} {hosts.get(g.head, '?')}")
         for w in g.workers:
             click.echo(f"  worker:  {w:14s} {hosts.get(w, '?')}:{g.rpc_port}")
+        # With the tunnel on, the head dials these and not the LAN addresses
+        # above — which is exactly what an operator reading `ss` on a worker
+        # needs to know.
+        wg_addresses = config.wireguard_addresses(g)
+        if wg_addresses is not None:
+            dials = ", ".join(f"{w} {wg_addresses[w]}:{g.rpc_port}" for w in g.workers)
+            click.echo(
+                f"  rpc:     over wireguard {config.wireguard_network(g)} "
+                f"(head {wg_addresses[g.head]}; dials {dials})"
+            )
         # https, and no plaintext spelling anywhere: both listeners on the head
         # serve TLS with the fleet CA, so an http:// URL copied from here fails
         # at the first byte rather than falling back. The host goes through the
@@ -1338,10 +1446,11 @@ esac
 # Both copies: pods run the image in K3s containerd, which `docker save | ctr
 # images import` populates separately. A stale import — the exact drift that
 # hangs an RPC handshake — is invisible if you only look at the Docker one.
-# (The Docker copy's build id and the two binary checksums come from the
-# spliced-in BUILD_PROBE above — one container start for all three, and the
-# same command the pre-start gate runs, so the doctor and the gate can never
-# disagree about what they measured.)
+# (The Docker copy's build record, the two binary checksums and the image's
+# architecture come from the spliced-in BUILD_PROBE above — one container start
+# for all four, and the same command the pre-start gate runs, so the doctor and
+# the gate can never disagree about what they measured. That architecture is
+# `image_arch`, not the `arch` on the first line above: that one is the host's.)
 echo "llama_build_k3s=$(timeout 10 sudo k3s ctr images ls -q 2>/dev/null | grep -c '^docker.io/library/aureax-client:dev$' | sed 's/^0$/MISSING/;s/^1$/present/')"
 echo "image_digest_docker=$(timeout 10 sudo docker image inspect aureax-client:dev --format '{{.Id}}' 2>/dev/null | cut -c8-19 || echo '?')"
 echo "image_digest_k3s=$(timeout 10 sudo k3s ctr images ls 2>/dev/null | awk '$1=="docker.io/library/aureax-client:dev"{print $3}' | cut -c8-19)"
@@ -1359,7 +1468,7 @@ done
 # named set so "was this member probed at all?" stays an honest question: a
 # member whose SSH failed still has its address, and treating that as facts
 # would make an unreachable node read as a coherent one.
-_DOCTOR_INJECTED_KEYS = frozenset({"ssh_host"})
+_DOCTOR_INJECTED_KEYS = frozenset({"ssh_host", "wg_host"})
 
 # What the probe prints between its facts and the tail of the node's logs.
 _DOCTOR_LOG_SEPARATOR = "--- last log lines ---"
@@ -1452,7 +1561,7 @@ def _group_problems(group, facts_by_node: dict[str, dict], head_id: str) -> tupl
             problems.append(
                 f"FAIL {nid}: llama.cpp build unreported — the probe said {raw or '(nothing)'!r},\n"
                 f"       so this group's build consistency cannot be checked. Every peer must run the\n"
-                f"       byte-identical build. Rebuild this node: ./scripts/update-all.sh"
+                f"       same llama.cpp build. Rebuild this node: ./scripts/update-all.sh"
             )
         else:
             builds[nid] = build
@@ -1468,12 +1577,16 @@ def _group_problems(group, facts_by_node: dict[str, dict], head_id: str) -> tupl
         if len(builds) == len(group.members) and len(set(builds.values())) == 1:
             notes.append(f"OK   all {len(builds)} member(s) run llama.cpp build b{head_build}")
 
-    # --- the binaries themselves, not the build id or the image digest -------
+    # --- the commit, and the binaries within one architecture ---------------
     # The stronger form of the check above and the one the pre-start gate runs:
-    # a build id is a git tag, so two members can report the same one and still
-    # hold different binaries (different compiler, different flags, a patched
-    # tree). The digests below cannot answer this at all — every node builds its
-    # own image, so they differ across a perfectly coherent group.
+    # a build id is a git tag, which can move, so the commit the image recorded
+    # is what has to match on every member; and within the head's architecture
+    # two members can report the same commit and still hold different binaries
+    # (different compiler, different flags, a patched tree), so there the bytes
+    # are compared too. Across architectures they never match, and a member of
+    # another architecture is compared by commit alone. The digests below cannot
+    # answer any of this — every node builds its own image, so they differ
+    # across a perfectly coherent group.
     from orchestrator.cluster import buildcheck
 
     # `probed`, not `facts_by_node`: a member that answered nothing at all
@@ -1638,6 +1751,11 @@ def _peer_verdict(group, facts_of: dict[str, dict], probed: dict[str, dict],
         if resolved is None:
             unresolved.append(host)
         addrs[nid] = {host} | (resolved or set())
+        # A group on WireGuard: the head holds its connections to the workers'
+        # TUNNEL addresses (injected by group_doctor), which no resolver knows.
+        wg_host = (facts_of.get(nid) or {}).get("wg_host")
+        if wg_host:
+            addrs[nid].add(wg_host)
 
     missing = sorted(host for nid, host in hosts.items() if not (peers & addrs[nid]))
     unexpected = sorted(p for p in peers if not any(p in a for a in addrs.values()))
@@ -1694,6 +1812,11 @@ def group_doctor(ctx: click.Context, name: str | None) -> None:
         # mapping between them. _DOCTOR_INJECTED_KEYS records that this one key
         # did not come from the node.
         facts: dict[str, str] = {"ssh_host": target.host}
+        # A group on WireGuard is attached over the tunnel, so the head's
+        # rpc_peers are tunnel addresses; the peer check needs those too.
+        wg_addresses = config.wireguard_addresses(g)
+        if wg_addresses is not None:
+            facts["wg_host"] = wg_addresses[node_id]
         lines = [click.style(f"\n-- {node_id} ({role}) {target.host}", fg="cyan")]
         try:
             rc, out, err = run_command(
@@ -1767,9 +1890,9 @@ def group_doctor(ctx: click.Context, name: str | None) -> None:
 def _build_floor_warning(line: str) -> list[str]:
     """Warning lines for a doctor probe line reporting a below-floor build.
 
-    The pin (b10375) is above every known fixed-in build for the 2026
-    llama-server/rpc-server CVE set, so a member below it is running
-    exploitable code. Reads the DOCKER copy's build id — a stale containerd
+    The floor (MIN_LLAMA_BUILD; the pin, b11429, clears it) is above every
+    known fixed-in build for the 2026 llama-server/rpc-server CVE set, so a
+    member below it is running exploitable code. Reads the DOCKER copy's build id — a stale containerd
     import can still lag it, which is what the image_digest_docker/k3s pair
     beside it exposes.
     """

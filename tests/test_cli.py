@@ -59,7 +59,7 @@ def test_all_subcommands_registered():
     result = runner.invoke(cli, ["--help"])
     expected = [
         "init", "nodes", "status", "generate", "deploy", "apply", "stop", "start",
-        "heal-nodes", "dashboard", "group", "bootstrap-keys", "tls",
+        "heal-nodes", "dashboard", "group", "bootstrap-keys", "tls", "wg",
     ]
     for cmd in expected:
         assert cmd in result.output, f"missing subcommand: {cmd}"
@@ -1469,15 +1469,21 @@ def _probe_out(build: str = "b10375", docker_digest: str = "1a2b3c4d5e6f",
                k3s_digest: str = "1a2b3c4d5e6f", k3s_image: str = "present",
                rpc_listen: int = 1, rpc_peers: str = "",
                llama_sha: str = _LLAMA_SHA, rpc_sha: str = _RPC_SHA,
-               build_probe_error: str = "") -> str:
-    """One member's stdout, in _DOCTOR_PROBE's exact shape."""
+               build_probe_error: str = "", arch: str = "aarch64",
+               commit: str = "0f1e2d3c") -> str:
+    """One member's stdout, in _DOCTOR_PROBE's exact shape.
+
+    ``arch`` is the IMAGE's `uname -m` (BUILD_PROBE's ``image_arch`` line); the
+    first line's ``arch=`` is the host's and stays aarch64 here.
+    """
     return (
         "arch=aarch64 cores=4 mem=13.2Gi\n"
         "nic=eth0 speed=1000Mb\n"
         "isa=3 dp/i8mm/bf16 flags\n"
-        f'llama_build_docker={{"version":"{build}","commit":"0f1e2d3c"}}\n'
+        f'llama_build_docker={{"version":"{build}","commit":"{commit}"}}\n'
         f"llama_server_sha={llama_sha}\n"
         f"rpc_server_sha={rpc_sha}\n"
+        f"image_arch={arch}\n"
         f"build_probe_error={build_probe_error}\n"
         f"llama_build_k3s={k3s_image}\n"
         f"image_digest_docker={docker_digest}\n"
@@ -1598,6 +1604,52 @@ def test_doctor_exits_one_when_a_members_binaries_differ(monkeypatch, tmp_path):
     assert "d" * 12 in result.output and "b" * 12 in result.output, "name both checksums"
     assert f"./scripts/build-on-node.sh {_W2_HOST}" in result.output
     assert "1/1 group(s) have problems: g1" in result.output
+
+
+def test_doctor_passes_a_cuda_member_built_from_the_heads_commit(monkeypatch, tmp_path):
+    """An x86_64 CUDA image and an aarch64 one never share bytes, so a mixed
+    group is compared by commit across architectures — and the verdict says so
+    on the member's own line instead of passing it silently."""
+    outputs = _healthy_fleet_output()
+    outputs[_W2_HOST] = _probe_out(llama_sha="c" * 64, rpc_sha="d" * 64, arch="x86_64",
+                                   rpc_peers=f"{_HEAD_HOST},")
+
+    result = _doctor(monkeypatch, tmp_path, outputs)
+
+    assert result.exit_code == 0, result.output
+    assert "OK   w2: x86_64 member compared by commit: same commit 0f1e2d3c" in result.output
+    assert "checksums identical on every aarch64 member (2/3 read)" in result.output
+    assert "1 group(s) coherent." in result.output
+
+
+def test_doctor_exits_one_when_a_cuda_member_is_on_another_commit(monkeypatch, tmp_path):
+    """The version lock holds across architectures: a different commit is a
+    hang at the handshake whatever the member's CPU."""
+    outputs = _healthy_fleet_output()
+    outputs[_W2_HOST] = _probe_out(llama_sha="c" * 64, rpc_sha="d" * 64, arch="x86_64",
+                                   commit="9a8b7c6d", rpc_peers=f"{_HEAD_HOST},")
+
+    result = _doctor(monkeypatch, tmp_path, outputs)
+
+    assert result.exit_code == 1, result.output
+    assert "FAIL w2: llama.cpp commit 9a8b7c6d does not match head h1's 0f1e2d3c" in result.output
+    assert f"./scripts/build-on-node.sh {_W2_HOST}" in result.output
+    assert "./scripts/update-all.sh" in result.output
+    assert "1/1 group(s) have problems: g1" in result.output
+
+
+def test_doctor_reads_the_image_architecture_in_the_same_container_start():
+    """Still one SSH round trip and ONE container start per member, and the
+    image's architecture lands under its own key — not over the host `arch`
+    fact the doctor's first line already reports."""
+    from orchestrator.cli import _DOCTOR_PROBE, _parse_doctor_facts
+
+    assert _DOCTOR_PROBE.count("docker run") == 1
+    assert '"image_arch=$(uname -m)"' in _DOCTOR_PROBE
+
+    facts = _parse_doctor_facts(_probe_out(arch="x86_64"))
+    assert facts["image_arch"] == "x86_64"
+    assert facts["arch"].startswith("aarch64"), "the host fact must survive the spliced-in probe"
 
 
 def test_doctor_notes_a_member_whose_checksums_could_not_be_read(monkeypatch, tmp_path):
@@ -1971,3 +2023,140 @@ def test_group_problems_is_pure_and_names_the_group_it_was_given():
     facts["w1"]["rpc_listen"] = "0"
     problems, _ = _group_problems(group, facts, "h1")
     assert len(problems) == 1 and problems[0].startswith("FAIL w1: nothing is listening")
+
+
+# --- `aureax wg` and the tunnel in `group list` / `group doctor` --------------
+
+
+def _wg_fleet(tmp_path, *, enabled: bool = True):
+    net = tmp_path / "wg-fleet.yaml"
+    net.write_text(
+        _FLEET_HEADER
+        + "    - {node_id: h1, host: 10.77.0.30}\n"
+        "    - {node_id: w1, host: 10.77.0.31}\n"
+        "    - {node_id: w2, host: 10.77.0.32}\n"
+        "    - {node_id: h2, host: 10.77.0.40}\n"
+        "    - {node_id: w3, host: 10.77.0.41}\n"
+        "node_groups:\n"
+        f"  - {{name: g1, head: h1, workers: [w1, w2], wireguard: {{enabled: {str(enabled).lower()}}}}}\n"
+        "  - {name: g2, head: h2, workers: [w3]}\n"
+    )
+    return net
+
+
+def test_wg_status_reports_each_member_without_minting(tmp_aureax_home, tmp_path):
+    result = CliRunner().invoke(cli, ["-c", str(_wg_fleet(tmp_path)), "wg", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "g1  [on] subnet 10.254.0.0/24  udp/51820  mtu 1420  keepalive 25s" in result.output
+    for node_id, addr in (("h1", "10.254.0.1"), ("w1", "10.254.0.2"), ("w2", "10.254.0.3")):
+        assert re.search(rf"{node_id}\s+{re.escape(addr)}\s+key file absent", result.output), node_id
+    assert "no key — run `aureax generate" in result.output
+    assert "g2  [off]" in result.output
+    assert not (tmp_aureax_home / ".aureax" / "wireguard").exists(), "status minted a key"
+
+
+def test_wg_status_shows_the_public_key_and_the_key_file(tmp_aureax_home, tmp_path):
+    from orchestrator.config import wgstore
+
+    pub = wgstore.ensure_key("w1")
+    result = CliRunner().invoke(cli, ["-c", str(_wg_fleet(tmp_path)), "wg", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert re.search(r"w1\s+10\.254\.0\.2\s+key file present", result.output)
+    assert f"public key {pub}" in result.output
+    assert wgstore.private_key("w1") not in result.output, "the private key must never be printed"
+
+
+def test_wg_regenerate_rotates_and_names_both_follow_up_steps(tmp_aureax_home, tmp_path):
+    from orchestrator.config import wgstore
+
+    before = wgstore.ensure_key("w1")
+    old_private = wgstore.private_key("w1")
+    result = CliRunner().invoke(
+        cli, ["-c", str(_wg_fleet(tmp_path)), "wg", "regenerate", "--node", "w1"]
+    )
+
+    assert result.exit_code == 0, result.output
+    after = wgstore.public_key("w1")
+    assert after != before
+    assert f"Rotated w1: public key {after}" in result.output
+    assert wgstore.previous_private_key("w1") == old_private
+    assert "aureax apply --node w1 --orchestrator-ip <ip>" in result.output
+    assert "aureax stop && aureax start" in result.output
+
+
+@pytest.mark.parametrize("node_id", ["w3", "nobody", "../x"])
+def test_wg_regenerate_refuses_a_node_outside_an_enabled_group(tmp_aureax_home, tmp_path, node_id):
+    result = CliRunner().invoke(
+        cli, ["-c", str(_wg_fleet(tmp_path)), "wg", "regenerate", "--node", "w1", "--node", node_id]
+    )
+
+    assert result.exit_code == 1
+    assert "not a member of a node group with wireguard.enabled" in result.output
+    assert not (tmp_aureax_home / ".aureax" / "wireguard").exists(), "a refusal rotated something"
+
+
+def test_wg_regenerate_needs_a_node(tmp_aureax_home, tmp_path):
+    result = CliRunner().invoke(cli, ["-c", str(_wg_fleet(tmp_path)), "wg", "regenerate"])
+    assert result.exit_code == 2
+
+
+def test_group_list_names_the_tunnel_the_head_dials(tmp_path):
+    result = CliRunner().invoke(cli, ["-c", str(_wg_fleet(tmp_path)), "group", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert ("rpc:     over wireguard 10.254.0.0/24 (head 10.254.0.1; dials "
+            "w1 10.254.0.2:50052, w2 10.254.0.3:50052)") in result.output
+    assert result.output.count("over wireguard") == 1, "g2 has no tunnel"
+
+    plain = CliRunner().invoke(cli, ["-c", str(_wg_fleet(tmp_path, enabled=False)), "group", "list"])
+    assert "wireguard" not in plain.output
+
+
+def test_doctor_accepts_a_head_attached_over_the_tunnel():
+    """The head's rpc_peers are tunnel addresses when the group is on
+    WireGuard; group_doctor injects each member's as `wg_host` so the peer
+    check does not call a fully attached group lopsided."""
+    from orchestrator.cli import _group_problems
+    from tests.conftest import make_network_config, make_targets
+
+    config = make_network_config(
+        make_targets("h1", "w1"),
+        groups=[{"name": "g1", "head": "h1", "workers": ["w1"], "wireguard": {"enabled": True}}],
+    )
+    group = config.node_groups[0]
+    common = {"llama_build_docker": '{"version":"b10375"}', "llama_build_k3s": "present",
+              "image_digest_docker": "aaaa", "image_digest_k3s": "aaaa"}
+    facts = {
+        "h1": {**common, "ssh_host": "10.77.0.1", "wg_host": "10.254.0.1",
+               "rpc_listen": "0", "rpc_peers": "10.254.0.2,"},
+        "w1": {**common, "ssh_host": "10.77.0.2", "wg_host": "10.254.0.2",
+               "rpc_listen": "1", "rpc_peers": "10.254.0.1,"},
+    }
+
+    problems, notes = _group_problems(group, facts, "h1")
+    assert problems == []
+    assert any("attached to all 1 worker(s)" in n for n in notes)
+
+    del facts["w1"]["wg_host"]
+    problems, _ = _group_problems(group, facts, "h1")
+    assert problems and "10.254.0.2, which is not in this group" in problems[0]
+
+
+def test_doctor_injects_each_members_tunnel_address(monkeypatch, tmp_path):
+    seen: dict[str, dict] = {}
+    from orchestrator import cli as cli_mod
+
+    def fake_problems(group, facts_by_node, head_id):
+        seen.update(facts_by_node)
+        return [], []
+
+    monkeypatch.setattr(cli_mod, "_group_problems", fake_problems)
+    monkeypatch.setattr("orchestrator.deploy.ssh.run_command", lambda *_a, **_k: (0, "", ""))
+    result = CliRunner().invoke(cli, ["-c", str(_wg_fleet(tmp_path)), "group", "doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["h1"]["wg_host"] == "10.254.0.1"
+    assert seen["w2"]["wg_host"] == "10.254.0.3"
+    assert "wg_host" not in seen["w3"], "g2 is not on WireGuard"

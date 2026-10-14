@@ -131,6 +131,39 @@ def test_flash_attn_defaults_to_auto_when_unset() -> None:
     assert args[args.index("--flash-attn") + 1] == "auto"
 
 
+# --- weight load mode --------------------------------------------------------
+#
+# --mlock, --mmap and --no-mmap were removed upstream in b10875 (#28334), and
+# llama-server exits 1 on an unknown argument. -lm/--load-mode exists with the
+# same values on both the old pin and the new one, so use_mmap/use_mlock map
+# onto it. The default pair is llama.cpp's own default and must emit nothing.
+
+
+@pytest.mark.parametrize(
+    ("use_mmap", "use_mlock", "expected"),
+    [
+        (True, False, None),
+        (False, False, "none"),
+        (True, True, "mmap+mlock"),
+        (False, True, "mlock"),
+    ],
+)
+def test_mmap_and_mlock_map_onto_load_mode(use_mmap, use_mlock, expected) -> None:
+    args = get_llama_server_args(_with_server(use_mmap=use_mmap, use_mlock=use_mlock))
+    if expected is None:
+        assert "--load-mode" not in args
+    else:
+        assert args.count("--load-mode") == 1
+        assert args[args.index("--load-mode") + 1] == expected
+    for removed in ("--mlock", "--mmap", "--no-mmap"):
+        assert removed not in args
+
+
+def test_omitted_mmap_and_mlock_emit_no_load_mode() -> None:
+    """An omitting config keeps llama.cpp's default, like the schema's True/False."""
+    assert "--load-mode" not in get_llama_server_args(BASE)
+
+
 def test_rpc_server_args_defaults(monkeypatch) -> None:
     monkeypatch.delenv("AUREAX_HOST_IP", raising=False)
     args = get_rpc_server_args({"model": {"rpc_server": {}}})
@@ -156,6 +189,18 @@ def test_rpc_server_omits_threads_when_negative() -> None:
     """-1 means 'let llama.cpp decide', matching the llama-server convention."""
     assert "-t" not in get_rpc_server_args({"model": {"rpc_server": {"threads": -1}}})
     assert "-t" in get_rpc_server_args({"model": {"rpc_server": {"threads": 4}}})
+
+
+def test_rpc_server_devices_are_comma_joined_and_omitted_when_unset() -> None:
+    """-d names the ggml devices this worker lends. Omitted, rpc-server exposes
+    every non-CPU device it finds, and each one is a slot in the head's split."""
+    cfg = {"model": {"rpc_server": {"host": "10.77.0.2", "devices": ["CUDA0"]}}}
+    args = get_rpc_server_args(cfg)
+    assert args[args.index("-d") + 1] == "CUDA0"
+    two = get_rpc_server_args({"model": {"rpc_server": {"host": "h", "devices": ["CUDA0", "CUDA1"]}}})
+    assert two[two.index("-d") + 1] == "CUDA0,CUDA1"
+    assert "-d" not in get_rpc_server_args({"model": {"rpc_server": {"host": "h"}}})
+    assert "-d" not in get_rpc_server_args({"model": {"rpc_server": {"host": "h", "devices": []}}})
 
 
 def test_rpc_server_cache_flag_is_bare() -> None:
@@ -193,6 +238,38 @@ def test_resolve_rpc_host_matches_the_bound_address(monkeypatch) -> None:
     monkeypatch.delenv("AUREAX_HOST_IP")
     cfg = {"model": {"rpc_server": {"host": "auto"}}}
     assert resolve_rpc_host(cfg) == get_rpc_server_args(cfg)[1] == "0.0.0.0"
+
+def test_auto_binds_the_wireguard_address_when_the_node_carries_one(monkeypatch) -> None:
+    """A member of a group with `wireguard.enabled` carries a stamped
+    node.wireguard block, and rpc-server must bind THAT address — the head
+    dials the tunnel, and the LAN address must not serve the port at all.
+    Probe and bind still agree, prefix length dropped (-H takes a bare address).
+    """
+    from client.config.parser import resolve_rpc_host
+
+    monkeypatch.setenv("AUREAX_HOST_IP", "192.0.2.20")
+    cfg = {
+        "node": {"role": "shard_worker", "wireguard": {"interface": "wg0", "address": "10.254.0.3/24"}},
+        "model": {"rpc_server": {"host": "auto"}},
+    }
+    args = get_rpc_server_args(cfg)
+    assert resolve_rpc_host(cfg) == args[args.index("-H") + 1] == "10.254.0.3"
+
+    # `host` absent means auto too.
+    cfg["model"]["rpc_server"] = {}
+    assert resolve_rpc_host(cfg) == "10.254.0.3"
+
+    # An explicit host still wins (validate_groups refuses one under WireGuard).
+    cfg["model"]["rpc_server"] = {"host": "127.0.0.1"}
+    assert resolve_rpc_host(cfg) == "127.0.0.1"
+
+    # Without the block — every node of a fleet that never enables the tunnel —
+    # nothing changes.
+    del cfg["node"]["wireguard"]
+    cfg["model"]["rpc_server"] = {"host": "auto"}
+    assert resolve_rpc_host(cfg) == "192.0.2.20"
+    cfg["node"]["wireguard"] = None
+    assert resolve_rpc_host(cfg) == "192.0.2.20"
 
 
 # --- speculative decoding ----------------------------------------------------
@@ -263,6 +340,98 @@ def test_draft_enabled_without_a_filename_is_refused_by_the_schema() -> None:
     # Both shipped head configs are enabled:false with a filename present.
     assert DraftModelConfig(enabled=False, filename="d.gguf").enabled is False
     assert DraftModelConfig(enabled=True, filename="d.gguf").enabled is True
+    # The model's own MTP head needs no draft file.
+    assert DraftModelConfig(enabled=True, type="draft-mtp").type == "draft-mtp"
+
+
+def test_draft_simple_emits_spec_type_and_keeps_the_draft_off_every_device() -> None:
+    """--spec-type is what turns the --spec-draft-* flags into a speculator at
+    all (the pinned build, like b10375, defaults the type list to {none}), and --spec-draft-device none
+    is what keeps the draft off the RPC workers the target is offloaded to."""
+    args = get_llama_server_args(
+        {
+            "tls": TLS,
+            "model": {
+                "draft": {"enabled": True, "filename": "d.gguf"},
+                "server": {"gpu_layers": 99, "rpc_servers": ["10.77.0.2:50052"]},
+            },
+        }
+    )
+    assert args[args.index("--spec-type") + 1] == "draft-simple"
+    assert args[args.index("--spec-draft-device") + 1] == "none"
+    # Every speculative flag precedes the RPC block: --device must stay the
+    # first flag after --rpc.
+    assert args.index("--spec-draft-device") < args.index("--rpc")
+
+
+def test_draft_devices_list_is_comma_joined_when_given() -> None:
+    args = get_llama_server_args(
+        {"tls": TLS, "model": {"draft": {"enabled": True, "filename": "d.gguf", "devices": ["CUDA0"]}}}
+    )
+    assert args[args.index("--spec-draft-device") + 1] == "CUDA0"
+
+
+def test_draft_mtp_emits_no_draft_model_flags() -> None:
+    """The MTP head lives inside the target GGUF: no file, no placement, no
+    draft threads — only the type and the n/p knobs."""
+    args = get_llama_server_args(
+        {"tls": TLS, "model": {"draft": {"enabled": True, "type": "draft-mtp", "n_max": 2}}}
+    )
+    assert args[args.index("--spec-type") + 1] == "draft-mtp"
+    assert args[args.index("--spec-draft-n-max") + 1] == "2"
+    for flag in ("--spec-draft-model", "--spec-draft-ngl", "--spec-draft-device", "--spec-draft-threads"):
+        assert flag not in args
+
+
+# --- sampler chain, prompt cache, checkpoints ---------------------------------
+
+def test_samplers_are_semicolon_joined_in_order_and_omitted_when_unset() -> None:
+    """llama-server splits --samplers on ';' and applies the chain in order.
+
+    The order is the point: backend sampling runs only the longest prefix of
+    backend-capable samplers, so [top_k, top_p, min_p, temperature] is a chain
+    that stays on the device end to end while the default chain's `dry` in
+    second place pulls everything back to the host.
+    """
+    args = get_llama_server_args(_with_server(samplers=["top_k", "top_p", "min_p", "temperature"]))
+    assert args[args.index("--samplers") + 1] == "top_k;top_p;min_p;temperature"
+    for empty in (None, []):
+        assert "--samplers" not in get_llama_server_args(_with_server(samplers=empty))
+
+
+def test_unknown_sampler_names_are_refused_by_the_schema() -> None:
+    """A typo would make llama-server exit at startup on every head."""
+    from pydantic import ValidationError
+
+    from orchestrator.config.schema import LlamaServerConfig
+
+    with pytest.raises(ValidationError, match=r"not a llama\.cpp sampler name"):
+        LlamaServerConfig(samplers=["top_k", "nucleus"])
+    assert LlamaServerConfig(samplers=["penalties", "top_k", "top_p", "min_p", "temperature"]).samplers
+
+
+def test_cache_ram_and_checkpoints_are_emitted_only_when_set() -> None:
+    """None means llama.cpp's own default; 0 is a real value and must reach argv —
+    on a sharded head --cache-ram 0 is the workaround for the prompt-cache save
+    path aborting over RPC (upstream issue #26529)."""
+    args = get_llama_server_args(_with_server(cache_ram_mib=0, ctx_checkpoints=8))
+    assert args[args.index("--cache-ram") + 1] == "0"
+    assert args[args.index("--ctx-checkpoints") + 1] == "8"
+    plain = get_llama_server_args(BASE)
+    assert "--cache-ram" not in plain
+    assert "--ctx-checkpoints" not in plain
+
+
+def test_cache_ram_and_checkpoints_reject_nonsense() -> None:
+    from pydantic import ValidationError
+
+    from orchestrator.config.schema import LlamaServerConfig
+
+    with pytest.raises(ValidationError, match="cache_ram_mib"):
+        LlamaServerConfig(cache_ram_mib=-2)
+    with pytest.raises(ValidationError, match="ctx_checkpoints"):
+        LlamaServerConfig(ctx_checkpoints=-1)
+    assert LlamaServerConfig(cache_ram_mib=-1).cache_ram_mib == -1
 
 
 # --- KV cache type -----------------------------------------------------------

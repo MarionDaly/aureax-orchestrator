@@ -78,6 +78,17 @@ MATRIX: dict[str, dict] = {
             "server": {"host": "0.0.0.0", "port": 8080},
         },
     },
+    # The model's own multi-token-prediction head: no draft file, no draft
+    # placement flags, only --spec-type and the n/p knobs.
+    "draft-mtp": {
+        "tls": TLS,
+        "model": {
+            "filename": "m-mtp.gguf",
+            "local_path": "/opt/aureax/models/",
+            "draft": {"enabled": True, "type": "draft-mtp", "n_max": 2},
+            "server": {"host": "0.0.0.0", "port": 8080},
+        },
+    },
     "fully-hardened": _cfg(
         context_size=131072,
         batch_size=256,
@@ -97,6 +108,9 @@ MATRIX: dict[str, dict] = {
         webui=False,
         cors_origins="https://console.example.internal",
         alias="qwen3.5-35b",
+        samplers=["top_k", "top_p", "min_p", "temperature"],
+        cache_ram_mib=0,
+        ctx_checkpoints=8,
     ),
 }
 
@@ -117,13 +131,22 @@ def _with_api_key(config: dict, key: str = SECRET) -> dict:
 ALLOWED_FLAGS = {
     "--model", "--host", "--port", "--ctx-size", "--batch-size",
     "--n-gpu-layers", "--parallel", "--threads", "--threads-batch",
-    "--mlock", "--no-mmap", "--flash-attn", "--jinja", "--metrics",
+    # use_mmap/use_mlock, mapped to a load mode (the old --mlock/--no-mmap
+    # spellings are gone upstream; see NEVER_EMITTED)
+    "--load-mode", "--flash-attn", "--jinja", "--metrics",
     "--backend-sampling", "-ctk", "-ctv",
+    # the sampler chain (what makes --backend-sampling remove the logits
+    # readback), the displaced-slot prompt cache (0 on a sharded head: the
+    # save path aborted over RPC at b10375, upstream #26529, and a fix is
+    # unconfirmed) and per-slot checkpoints
+    "--samplers", "--cache-ram", "--ctx-checkpoints",
     # HTTP surface hardening
     "--no-slots", "--no-webui", "--cors-origins", "--alias",
-    # speculative decoding
-    "--spec-draft-model", "--spec-draft-n-max", "--spec-draft-n-min",
-    "--spec-draft-p-min", "--spec-draft-ngl", "--spec-draft-threads",
+    # speculative decoding. --spec-type is the one that makes the rest do
+    # anything: without it the pinned build loads the draft and creates no
+    # speculator.
+    "--spec-type", "--spec-draft-model", "--spec-draft-n-max", "--spec-draft-n-min",
+    "--spec-draft-p-min", "--spec-draft-ngl", "--spec-draft-device", "--spec-draft-threads",
     # TLS (mandatory) — paths only, never key material; see the ssl test below
     "--ssl-cert-file", "--ssl-key-file",
     # distributed inference (always last)
@@ -177,6 +200,12 @@ NEVER_EMITTED = (
     # that is meant to exist, and it clamps n_ubatch downward only.
     "--ubatch-size",
     "-ub",
+    # Removed upstream in b10875 (#28334) in favour of --load-mode, which is
+    # what use_mmap/use_mlock map to now; llama-server exits 1 on an unknown
+    # argument, so emitting any of these crash-loops the node.
+    "--mlock",
+    "--no-mmap",
+    "--mmap",
 )
 
 
@@ -207,10 +236,38 @@ def test_every_emitted_flag_is_on_the_allowlist(name) -> None:
     assert emitted <= ALLOWED_FLAGS, f"unlisted flag(s): {sorted(emitted - ALLOWED_FLAGS)}"
 
 
+@pytest.mark.parametrize("name", MATRIX_IDS)
+def test_a_draft_model_is_never_emitted_without_a_spec_type(name) -> None:
+    """--spec-draft-* without --spec-type is a loaded, unused draft.
+
+    On the pinned build (b11429, as at b10375) the default speculative type
+    list is {none} and a speculator is
+    created only for a listed type (common/speculative.cpp), so a command line
+    carrying --spec-draft-model and no --spec-type makes llama-server load the
+    draft and then discard it — paid for, never used, and the only symptom is a
+    `loading draft model` log line with no acceptance statistics after it.
+    That is exactly the shape this builder emitted before the `type` field
+    existed, and it is why the fleet's earlier speculation measurement showed
+    nothing. Pinned so it cannot come back.
+    """
+    args = get_llama_server_args(_with_api_key(MATRIX[name]))
+    if "--spec-draft-model" in args:
+        assert "--spec-type" in args
+        assert args[args.index("--spec-type") + 1] == "draft-simple"
+
+
+def test_the_sampler_chain_is_joined_the_way_llama_server_parses_it() -> None:
+    """--samplers takes a ';'-separated list in chain order; a ',' is one name."""
+    args = get_llama_server_args(_with_api_key(MATRIX["fully-hardened"]))
+    assert args[args.index("--samplers") + 1] == "top_k;top_p;min_p;temperature"
+
+
 # Schema fields that are deliberately not argv inputs, so MATRIX owes them
 # nothing: health_timeout_seconds is read by the supervisor's own health wait
 # (client/entrypoint.py::_wait_for_llama_health), never by the arg builder.
-NON_ARGV_SERVER_FIELDS = {"health_timeout_seconds"}
+# rpc_device_count is stamped by the generator for the head's own topology
+# check (client/entrypoint.py::_verify_rpc_topology); nothing emits it.
+NON_ARGV_SERVER_FIELDS = {"health_timeout_seconds", "rpc_device_count"}
 
 
 def test_every_llama_server_config_field_is_exercised() -> None:

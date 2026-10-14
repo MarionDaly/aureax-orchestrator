@@ -342,17 +342,18 @@ ok "Per-node configs regenerated and pushed"
 # --- Step 3: Restart pods to pick up new image + config ---
 #
 # `aureax apply --all`, NOT `kubectl rollout restart`. A DaemonSet rollout is
-# serial across the whole fleet, so it cold-reloads every head one after the
+# serial across the whole fleet, so it reloads every head one after the
 # other — minutes each — and tests/test_apply.py pins that the restart path
 # never invokes it. apply's primitive is a targeted pod delete per node
 # (orchestrator/cluster/kubectl.py::delete_pods_on_node).
 #
 # apply restarts HEADS AND STANDALONE NODES ONLY. Shard workers are pushed but
 # never restarted: rpc-server takes no API key, and bouncing one tears the head
-# off its peers and invalidates the tensor cache, turning a ~107s warm reload
-# into a ~280s cold one. The consequence for THIS script is that a worker keeps
-# running its previous image. That is harmless for a Python-only change — which
-# is what this script is for — but if LLAMA_CPP_VERSION moved in either
+# off its peers and forces a group reload — the ~107s warm one, since the
+# content-addressed tensor cache survives the restart, but minutes of outage
+# all the same. The consequence for THIS script is that a worker keeps running
+# its previous image. That is harmless for a Python-only change — which is
+# what this script is for — but if LLAMA_CPP_VERSION moved in either
 # Dockerfile the head and its peers are then on different builds, and the RPC
 # wire format is version-locked: the group HANGS at the handshake instead of
 # reporting an error. Bounce the whole fleet with
@@ -373,7 +374,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
     [ "${NODE_ROLES[$i]}" = "$SHARD_WORKER_ROLE" ] && WORKER_COUNT=$((WORKER_COUNT + 1))
 done
 if [ "$WORKER_COUNT" -gt 0 ]; then
-    info "${WORKER_COUNT} shard worker(s) keep their running pod — restarting one forces a cold group reload"
+    info "${WORKER_COUNT} shard worker(s) keep their running pod — restarting one forces a whole-group reload"
 fi
 
 info "Restarting head/standalone pods onto the new image and config..."

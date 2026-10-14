@@ -25,7 +25,7 @@ FROM debian:bookworm-slim AS llama-builder
 # libssl-dev is load-bearing, not incidental. TLS is mandatory fleet-wide, so
 # llama-server has to be linked against OpenSSL — and llama.cpp's LLAMA_OPENSSL
 # option degrades to a CMake WARNING when find_package(OpenSSL) fails
-# (vendor/cpp-httplib/CMakeLists.txt at b10375), so a builder missing these
+# (vendor/cpp-httplib/CMakeLists.txt at b11429), so a builder missing these
 # headers still produces a green build and an image whose llama-server exits
 # with "the server is built without SSL support" the moment a head starts.
 # Bookworm ships OpenSSL 3.0.x, which clears cpp-httplib's >= 3.0.0 gate.
@@ -40,12 +40,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Clone and build llama.cpp with ARM NEON optimizations.
 #
-# PINNED, deliberately. The RPC wire format is version-locked: every peer in a
-# sharded group must run the byte-identical build, and a mismatch HANGS at the
-# handshake rather than reporting an error. A floating `master` means two nodes
-# built a day apart are different software.
+# PINNED, deliberately. The RPC wire format is version-locked to the llama.cpp
+# COMMIT: every peer in a sharded group must be built from the same commit
+# (and, within one architecture, be byte-identical), and a mismatch HANGS at
+# the handshake rather than reporting an error. A floating `master` means two
+# nodes built a day apart are different software.
 #
-# b10375 chosen because it is well past both:
+# b11429 chosen because it is well past both:
 #   - b8492, which fixed CVE-2026-34159 (unauthenticated RCE in the RPC
 #     backend via a GRAPH_COMPUTE buffer=0 deserialization bypass, CVSS 9.8)
 #   - the multi-machine tensor-split regression tracked in issue #21006
@@ -59,8 +60,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # tolerate. The check below turns that into a failed build here instead of a
 # hung handshake on the fleet. Both Dockerfiles carry the same pair, for the
 # same lockstep reason.
-ARG LLAMA_CPP_VERSION=b10375
-ARG LLAMA_CPP_COMMIT=ba360efe1f574ebae727aad64112d18ecedca85a
+ARG LLAMA_CPP_VERSION=b11429
+ARG LLAMA_CPP_COMMIT=d81235049384534c167caea52b85a694f6103d14
 RUN git clone --depth 1 --branch ${LLAMA_CPP_VERSION} \
     https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
@@ -75,8 +76,16 @@ RUN git rev-parse HEAD > /build/llama-commit.txt && \
         echo "       LLAMA_CPP_VERSION was bumped without LLAMA_CPP_COMMIT (update both ARGs together)" >&2; \
         exit 1; \
     fi && \
-    printf '{"version":"%s","commit":"%s"}\n' \
-        "${LLAMA_CPP_VERSION}" "$(cat /build/llama-commit.txt)" > /build/llama-build.json
+    RPC_PROTO="$(awk '/define RPC_PROTO_MAJOR_VERSION/{a=$3} /define RPC_PROTO_MINOR_VERSION/{b=$3} \
+        /define RPC_PROTO_PATCH_VERSION/{c=$3} END{if (a!="" && b!="" && c!="") printf "%s.%s.%s", a, b, c}' \
+        ggml/include/ggml-rpc.h)" && \
+    if [ -z "${RPC_PROTO}" ]; then \
+        echo "ERROR: could not read RPC_PROTO_*_VERSION from ggml/include/ggml-rpc.h — upstream moved it;" >&2; \
+        echo "       the head's peer wait compares workers against this value (client/entrypoint.py)" >&2; \
+        exit 1; \
+    fi && \
+    printf '{"version":"%s","commit":"%s","rpc_proto":"%s"}\n' \
+        "${LLAMA_CPP_VERSION}" "$(cat /build/llama-commit.txt)" "${RPC_PROTO}" > /build/llama-build.json
 
 # -DGGML_RPC=ON is what produces the RPC backend AND the ggml-rpc-server tool.
 #
@@ -87,18 +96,40 @@ RUN git rev-parse HEAD > /build/llama-commit.txt && \
 # compiling with +i8mm would produce exactly that SIGILL.
 #
 # -DLLAMA_OPENSSL=ON is what gives llama-server --ssl-cert-file/--ssl-key-file,
-# which every node now needs. At b10375 that is the option's exact spelling —
+# which every node now needs. At b11429 that is the option's exact spelling —
 # there is no LLAMA_SERVER_SSL, and a misspelt -D is only an unused cache
 # variable CMake mentions in passing before succeeding. It already defaults to
 # ON, so this line exists to put a future default flip in this diff rather than
 # on the fleet; the ldd assertion below is what actually enforces the outcome.
+#
+# -DGGML_CPU_REPACK=ON is the current spelling of what used to be
+# GGML_CPU_AARCH64 — renamed at b5615, after which the old -D was only an
+# unused variable. It too defaults ON and is spelt out for the same reason.
+# Repack only applies to tensors in the head's own CPU buffers: rpc-server
+# allocates plain CPU buffers, so workers never run the repacked kernels, and
+# prefill on a worker is about 1.5x slower than a single-node llama-bench
+# would suggest. Decode is unaffected. (Derived from llama.cpp source at
+# b10375; not re-derived at b11429.)
+#
+# The embedded web UI is NOT pinned by LLAMA_CPP_COMMIT on its own. At b11429
+# LLAMA_BUILD_UI defaults OFF while LLAMA_USE_PREBUILT_UI stays ON, so the
+# configure step below downloads the prebuilt UI from Hugging Face, trying the
+# requested version and then `latest`. Under the `git clone --depth 1` above
+# llama.cpp's own BUILD_NUMBER comes out as 1, so left to itself the fetch
+# would land on `latest` and two nodes built on different days could embed
+# different UI bytes in an otherwise identical llama-server — sha256 drift that
+# the group build gate would refuse. -DHF_UI_VERSION below therefore names the
+# pinned tag's own asset, so every build of this pin fetches the same bytes.
+# (A node that cannot reach huggingface.co still falls back to `latest`, then
+# to no embedded UI, with only a cmake WARNING — the gate is what catches it.)
 RUN cmake -S . -B build -G Ninja \
     -DGGML_CPU=ON \
-    -DGGML_CPU_AARCH64=ON \
+    -DGGML_CPU_REPACK=ON \
     -DGGML_RPC=ON \
     -DGGML_NATIVE=OFF \
     -DGGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod \
     -DLLAMA_OPENSSL=ON \
+    -DHF_UI_VERSION=${LLAMA_CPP_VERSION} \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF \
@@ -109,7 +140,7 @@ RUN cmake -S . -B build -G Ninja \
 
 # Fail the BUILD if HTTPS did not make it in, because nothing downstream will.
 # LLAMA_OPENSSL defaults ON but degrades to message(WARNING) when OpenSSL is
-# absent or older than 3.0 (vendor/cpp-httplib/CMakeLists.txt at b10375), so
+# absent or older than 3.0 (vendor/cpp-httplib/CMakeLists.txt at b11429), so
 # the only difference between an image that serves TLS and one that cannot is
 # two DT_NEEDED entries in this binary. Left unchecked, the failure surfaces
 # minutes later and on another machine, as every head crash-looping with
@@ -273,7 +304,7 @@ ENV AUREAX_CONFIG_PATH=/etc/aureax/aureax-edge.yaml
 
 # Surfaced as an image label so drift between group members can be detected
 # before it manifests as a hung RPC handshake.
-ARG LLAMA_CPP_VERSION=b10375
+ARG LLAMA_CPP_VERSION=b11429
 LABEL io.aureax.llama-version="${LLAMA_CPP_VERSION}"
 
 # Entrypoint
